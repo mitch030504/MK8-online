@@ -71,10 +71,16 @@ static uint64_t mk8_oq_pending_pair(const uint64_t *a, const uint64_t *b) {
     return seq;
 }
 void renderer_flush(void);
+static int mk8_oq_stale = -1;  // MK8_OCCL_STALE=1 (experiment, default off): read the counters anyway
 static void mk8_oq_wait_pair(const uint64_t *q) {  // renderer owner, before either CPU operand load
     if (!q) return;
     uint64_t seq = mk8_oq_pending_pair(q, q + 2);
     if (!seq) return;  // no report dependency: no submission or wait
+    if (mk8_oq_stale < 0) mk8_oq_stale = getenv("MK8_OCCL_STALE") != NULL;
+    // Experiment: keep the value the last completed submission wrote and skip the GPU round trip. Safe only as a
+    // one-submission-stale visibility decision; the first occurrence reads the guest's initial zeros (objects hidden
+    // for that submission). Never skips a wait that is not about this pair: unrelated reports still resolve first.
+    if (mk8_oq_stale) return;
     uint64_t pending = vk_pending_seq();
     if (seq > pending) FATAL("[mk8] occlusion report beyond pending submission\\n");
     wait_why = "conditional samples";
@@ -151,6 +157,15 @@ REPORT_NEW = '''            bool reset_samples = r->x[0] == 0x100000001ull;
                     vk_end_pass();  // (queries are begun and ended outside render passes: they may span several)
                     VkCommandBuffer qcb = vk_cmd();
                     Mk8Oq *o = &mk8_oq[cur_sub];
+                    // Preserve the cumulative counter across pool exhaustion instead of dropping reports.
+                    // Submit outside cq_lock; retirement resolves the old slot under that lock.
+                    if (o->n >= MK8_OQ_MAX || o->nrep >= MK8_OQ_MAX) {
+                        renderer_flush();
+                        qcb = vk_cmd();
+                        o = &mk8_oq[cur_sub];
+                    }
+                    if (!o->pool || o->n >= MK8_OQ_MAX || o->nrep >= MK8_OQ_MAX)
+                        FATAL("[mk8] occlusion report has no query capacity\\n");
                     pthread_mutex_lock(&cq_lock);
                     // (nothing written now: the GPU writes a report when it is past it - here at resolve, value and
                     // time together; a provisional value mixed with a resolved one made glows huge, boots 214/216)

@@ -71,6 +71,8 @@ pub struct App {
     resources_state: &'static str,
     resources_detail: String,
     mii_download: crate::mii_download::Download,
+    /// The child running the terms-gated FSR SDK download/build.
+    fsr_job: Option<crate::fsr::install::Job>,
     /// Steam lobby invites received from friends (lobby, friend), until accepted or the room is gone.
     steam_invites: Vec<(u64, u64)>,
     /// After creating or entering a Steam room: open the game in it as soon as the transport connects.
@@ -195,6 +197,7 @@ impl App {
             resources_state: "idle",
             resources_detail: String::new(),
             mii_download: Default::default(),
+            fsr_job: None,
             steam_invites: Vec::new(),
             pending_play: None,
             steam_auto_join,
@@ -381,7 +384,7 @@ impl App {
                 self.pending_play = None;
             } else if self.gateway.as_ref().is_some_and(|g| g.connected()) {
                 self.pending_play = None;
-                if let Err(error) = self.start_game(true, play.auto_lan()) {
+                if let Err(error) = self.start_game(true, play.auto_lan(), false) {
                     self.steam_error = Some(error);
                 }
             }
@@ -389,7 +392,24 @@ impl App {
     }
 
     /// Starts the game (in the connected room when `online`); `auto_lan` makes it enter the LAN room by itself.
-    fn start_game(&mut self, online: bool, auto_lan: Option<&str>) -> Result<u32> {
+    pub fn play_direct(&mut self) -> Result<()> {
+        self.start_game(false, None, false)?;
+        let mut child = self.game.take().ok_or("O jogo não iniciou")?;
+        let status = child.wait().map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err(format!(
+                "O jogo encerrou com erro: {status}. Consulte game.log na pasta de dados."
+            ));
+        }
+        Ok(())
+    }
+
+    fn start_game(&mut self, online: bool, auto_lan: Option<&str>, nextendo: bool) -> Result<u32> {
+        if nextendo
+            && (!mk8_installer::nextendo_trusted(&self.local) || online || auto_lan.is_some())
+        {
+            return Err("Nextendo indisponível nesta sessão.".into());
+        }
         self.dlc_import.poll();
         self.ctgp_import.poll();
         if self.imports_running() {
@@ -397,8 +417,12 @@ impl App {
         }
         self.poll_native();
         self.poll_resources();
+        self.poll_fsr();
         if self.native_job.is_some() || self.resources_job.is_some() {
             return Err("Aguarde a conversão Mii terminar.".into());
+        }
+        if self.fsr_job.is_some() {
+            return Err("Aguarde a instalação do FSR terminar.".into());
         }
         if self.game.is_some() {
             return Err("O jogo já está aberto.".into());
@@ -431,6 +455,7 @@ impl App {
             username: self.username.clone(),
             candidate,
             auto_lan: auto_lan.map(str::to_owned),
+            nextendo,
         })?;
         let pid = child.id();
         self.game_exit = None;
@@ -539,6 +564,45 @@ impl App {
         Ok(value)
     }
 
+    fn poll_fsr(&mut self) {
+        let Some(job) = self.fsr_job.as_mut() else {
+            return;
+        };
+        match job.poll() {
+            Ok(None) => (),
+            Ok(Some(exit)) => {
+                let log = job.log_path();
+                self.fsr_job = None;
+                if !exit.success() {
+                    let dir = crate::fsr::data_dir();
+                    let recorded = crate::fsr::install::read_installed(&dir)
+                        .is_some_and(|installed| installed.state == "failed");
+                    if !recorded {
+                        let _ = crate::fsr::install::record_failure(
+                            &dir,
+                            &format!(
+                                "A instalação do FSR terminou com erro ({exit}). Consulte o log em {}.",
+                                log.display()
+                            ),
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                self.fsr_job = None;
+                let _ = crate::fsr::install::record_failure(
+                    &crate::fsr::data_dir(),
+                    &format!("Não foi possível consultar a instalação do FSR: {error}"),
+                );
+            }
+        }
+    }
+
+    fn fsr_page(&mut self) -> Result<Value> {
+        self.poll_fsr();
+        crate::fsr::page(&self.root, &self.local, self.fsr_job.is_some())
+    }
+
     fn store_config(&mut self, config: Config) -> Result<()> {
         if self.prepare_after_setup
             || self.build.poll().state == "running"
@@ -593,6 +657,10 @@ impl App {
     }
 
     fn start_build(&mut self) -> Result<()> {
+        self.tools = setup::tool_checks(&self.root);
+        if !self.tools.iter().all(|check| check["ok"] == true) {
+            return Err("Instale as ferramentas antes de iniciar a build.".into());
+        }
         if self.imports_running() {
             return Err("Aguarde a importação do DLC ou do CTGP.".into());
         }
@@ -728,9 +796,14 @@ impl App {
         let candidate_version = load::<Value>(&built_with)
             .ok()
             .and_then(|v| v["version"].as_str().map(str::to_owned));
-        let candidate_stale =
-            candidate_exists && candidate_version.as_deref() != Some(update::CURRENT);
         let install = self.installation();
+        let candidate = self.candidate();
+        let nextendo_supported = install
+            .as_ref()
+            .or(candidate.as_ref())
+            .is_some_and(|game| game.nextendo_supported);
+        let candidate_stale = candidate_exists
+            && (candidate_version.as_deref() != Some(update::CURRENT) || !nextendo_supported);
         let dlc =
             mk8_installer::dlc::status(&self.local, install.as_ref().or(self.candidate().as_ref()));
         let ctgp = mk8_installer::ctgp::status(
@@ -763,11 +836,17 @@ impl App {
             .map(|room| room.code.clone())
             .or_else(|| self.steam_room.as_ref().map(|room| room.code.clone()))
             .or(p2p_code);
-        json!({"dlc":dlc,"dlc_import":self.dlc_import.status(),"ctgp":ctgp,"ctgp_import":self.ctgp_import.status(),"mii_preparation":mii_preparation,"package_import":package_import,"import_ready":package_import && imported.is_dir(),"room_menu":self.room_menu,"setup":self.setup.status(),"tools":self.tools,"tools_ready":self.tools.iter().all(|c|c["ok"]==true),"native_dialogs":self.window.is_some(),"build":build,"candidate":candidate_exists,"candidate_stale":candidate_stale,"candidate_version":candidate_version,"game_exit":self.game_exit,"installed":install.is_some(),"profile":install.as_ref().map(|i|&i.profile),"gameplay_verified":install.as_ref().is_some_and(|i|i.gameplay_verified),"game_pid":self.game.as_ref().map(|c|c.id()),"session":{"hosting":self.host.is_some(),"internet_available":relay::url().is_some(),"room_code":room_code,"stun_endpoint":self.host.as_ref().and_then(|h|h.stun_endpoint.map(|e|e.to_string())),"steam_available":steam_status.dll_found,"steam_active":self.steam_room.is_some(),"steam_lobby_id":self.steam_room.as_ref().map(|r|r.lobby_id.to_string()),"steam_persona":steam_status.persona,"steam_ready":steam_status.ready,"steam_invites":self.steam_invites.len(),"steam_error":self.steam_error,"pending_play":self.pending_play.map(|play| play.role),"steam_auto_join":self.steam_auto_join,"relay":self.host.as_ref().map(|h|h.address.to_string()),"participants":self.host.as_ref().map(|h|h.connected()).unwrap_or(0),"connected":self.gateway.as_ref().is_some_and(|g|g.connected()),"slot":self.gateway.as_ref().map(|g|g.slot),"bridge_port":self.gateway.as_ref().map(|g|g.local_addr.port()),"diagnostic_only":install.is_none() && self.candidate().is_none()},"checks":mk8_installer::inspect(&paths),"files":game_files(&self.config, package_import && imported.is_dir()),"upstream":"Runtime local","root":self.root,"version":update::CURRENT,"updates":{"configured":update::repository().is_some(),"installable":update::installable()},"last_report":self.last_report,"data_dir":self.local,"windowed":self.window.is_some()})
+        let mut status = json!({"dlc":dlc,"dlc_import":self.dlc_import.status(),"ctgp":ctgp,"ctgp_import":self.ctgp_import.status(),"mii_preparation":mii_preparation,"package_import":package_import,"import_ready":package_import && imported.is_dir(),"room_menu":self.room_menu,"setup":self.setup.status(),"tools":self.tools,"tools_ready":self.tools.iter().all(|c|c["ok"]==true),"native_dialogs":self.window.is_some(),"build":build,"candidate":candidate_exists,"candidate_stale":candidate_stale,"candidate_version":candidate_version,"game_exit":self.game_exit,"installed":install.is_some(),"profile":install.as_ref().map(|i|&i.profile),"gameplay_verified":install.as_ref().is_some_and(|i|i.gameplay_verified),"game_pid":self.game.as_ref().map(|c|c.id()),"session":{"hosting":self.host.is_some(),"internet_available":relay::url().is_some(),"room_code":room_code,"stun_endpoint":self.host.as_ref().and_then(|h|h.stun_endpoint.map(|e|e.to_string())),"steam_available":steam_status.dll_found,"steam_active":self.steam_room.is_some(),"steam_lobby_id":self.steam_room.as_ref().map(|r|r.lobby_id.to_string()),"steam_persona":steam_status.persona,"steam_ready":steam_status.ready,"steam_invites":self.steam_invites.len(),"steam_error":self.steam_error,"pending_play":self.pending_play.map(|play| play.role),"steam_auto_join":self.steam_auto_join,"relay":self.host.as_ref().map(|h|h.address.to_string()),"participants":self.host.as_ref().map(|h|h.connected()).unwrap_or(0),"connected":self.gateway.as_ref().is_some_and(|g|g.connected()),"slot":self.gateway.as_ref().map(|g|g.slot),"bridge_port":self.gateway.as_ref().map(|g|g.local_addr.port()),"diagnostic_only":install.is_none() && self.candidate().is_none()},"checks":mk8_installer::inspect(&paths),"files":game_files(&self.config, package_import && imported.is_dir()),"upstream":"Runtime local","root":self.root,"version":update::CURRENT,"updates":{"configured":update::repository().is_some(),"installable":update::installable()},"last_report":self.last_report,"data_dir":self.local,"windowed":self.window.is_some()});
+        status["nextendo_trusted"] = json!(mk8_installer::nextendo_trusted(&self.local));
+        status["nextendo_supported"] =
+            json!(nextendo_supported || mk8_installer::nextendo_test_configured());
+        status["nextendo_game_key"] = json!(mk8_installer::NEXTENDO_GAME_KEY);
+        status
     }
     fn handle(&mut self, method: &Method, path: &str, body: &str) -> Result<Value> {
         self.dlc_import.poll();
         self.ctgp_import.poll();
+        self.poll_fsr();
         if method == &Method::Post
             && self.imports_running()
             && !matches!(path, "/api/language" | "/api/browse" | "/api/dlc/files")
@@ -784,9 +863,17 @@ impl App {
                 ))
             }
             ("GET", "/api/settings") => crate::game_settings::read(&self.local),
+            ("GET", "/api/debug-options") => Ok(json!(crate::debug_options::read(&self.local)?)),
+            ("POST", "/api/debug-options") => {
+                let options: crate::debug_options::Options =
+                    serde_json::from_str(body).map_err(|e| e.to_string())?;
+                crate::debug_options::write(&self.local, &options)?;
+                Ok(json!({"message":"Preferência salva. A alteração vale ao iniciar o jogo."}))
+            }
             ("GET", "/api/fonts") => crate::fonts::status(&self.local),
             ("POST", "/api/settings")
             | ("POST", "/api/fonts")
+            | ("POST", "/api/fsr/settings")
             | ("POST", "/api/dlc/toggle")
             | ("POST", "/api/dlc/import")
             | ("POST", "/api/ctgp/toggle")
@@ -832,6 +919,15 @@ impl App {
                     return Ok(
                         json!({"message":"Configurações salvas. As alterações valem ao iniciar o jogo."}),
                     );
+                }
+                if path == "/api/fsr/settings" {
+                    let settings: crate::fsr::Settings =
+                        serde_json::from_str(body).map_err(|_| "Preferências FSR inválidas.")?;
+                    crate::fsr::write_settings(&self.local, &settings)?;
+                    return Ok(json!({
+                        "settings": settings,
+                        "message": "Preferências FSR salvas. Valem ao iniciar o jogo.",
+                    }));
                 }
                 let install = self.installation().or_else(|| self.candidate()).ok_or(
                     if path.starts_with("/api/ctgp/") {
@@ -932,6 +1028,75 @@ impl App {
             }
             ("GET", "/api/dlc/log") => Ok(json!({"text":self.log_tail("dlc.log")?})),
             ("GET", "/api/ctgp/log") => Ok(json!({"text":self.log_tail("ctgp.log")?})),
+            ("GET", "/api/fsr") => self.fsr_page(),
+            ("POST", "/api/fsr/license") => {
+                let dir = crate::fsr::data_dir();
+                let text = crate::fsr::install::fetch_license(&dir)?;
+                Ok(json!({
+                    "text": text,
+                    "license": crate::fsr::license_status(&dir),
+                    "message": "Licença da AMD carregada da fonte oficial (SDK v2.4.0).",
+                }))
+            }
+            ("POST", "/api/fsr/accept") => {
+                let dir = crate::fsr::data_dir();
+                crate::fsr::install::accept_terms(&dir)?;
+                Ok(json!({
+                    "license": crate::fsr::license_status(&dir),
+                    "message": "Termos da AMD aceitos. O download só começa quando você pedir.",
+                }))
+            }
+            ("POST", "/api/fsr/install") => {
+                self.poll_fsr();
+                if self.fsr_job.is_some() {
+                    return Err("A instalação do FSR já está em andamento.".into());
+                }
+                self.status();
+                if self.session_busy()
+                    || self.setup.running()
+                    || self.imports_running()
+                    || self.build.poll().state == "running"
+                {
+                    return Err(
+                        "Feche o jogo e aguarde a operação atual antes de instalar o FSR.".into(),
+                    );
+                }
+                let settings = crate::fsr::read_settings(&self.local)?;
+                if cfg!(windows) {
+                    let gate = crate::fsr::fsr4_gate(&settings);
+                    if crate::fsr::fsr4_selection_blocked(&settings, &gate) {
+                        return Err(gate.reason);
+                    }
+                }
+                if cfg!(target_os = "linux")
+                    && settings.upscaling != "3.1.6"
+                    && settings.upscaling != "4.1.2"
+                    && settings.frame_generation != "fsr3"
+                {
+                    return Err(
+                        "Nada para instalar: selecione FSR 3.1.6, FSR 4.1.2 ou FSR 3 nos componentes locais."
+                            .into(),
+                    );
+                }
+                if !crate::fsr::terms_accepted(&crate::fsr::data_dir()) {
+                    return Err("Leia e aceite a licença da AMD antes de baixar o SDK.".into());
+                }
+                self.fsr_job = Some(crate::fsr::install::Job::start(
+                    &self.root,
+                    &self.local,
+                    &settings,
+                )?);
+                self.fsr_page()
+            }
+            ("POST", "/api/fsr/cancel") => {
+                if let Some(mut job) = self.fsr_job.take() {
+                    job.cancel()?;
+                }
+                Ok(json!({"message":"Instalação do FSR cancelada."}))
+            }
+            ("GET", "/api/fsr/log") => Ok(json!({
+                "text": crate::fsr::install::log_tail(&crate::fsr::data_dir(), 200),
+            })),
             ("GET", "/api/status") => Ok(self.status()),
             ("GET", "/api/config") => Ok(serde_json::to_value(&self.config).unwrap()),
             ("GET", "/api/username") => Ok(json!(self.username)),
@@ -1469,10 +1634,22 @@ impl App {
                 }
                 Ok(json!({"message":"Sessão encerrada."}))
             }
+            ("POST", "/api/nextendo/trust") => {
+                let value: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+                mk8_installer::trust_nextendo(&self.local, value["key"].as_str().unwrap_or(""))?;
+                Ok(json!({}))
+            }
             ("POST", "/api/play") => {
                 self.status();
                 let value: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
-                let pid = self.start_game(value["online"].as_bool().unwrap_or(false), None)?;
+                let nextendo = value["nextendo"].as_bool().unwrap_or(false);
+                let pid =
+                    self.start_game(value["online"].as_bool().unwrap_or(false), None, nextendo)?;
+                if nextendo {
+                    return Ok(
+                        json!({"message":"Entre no Nextendo pelo navegador. No jogo, escolha Online Play. CTGP fica desativado nesta sessão."}),
+                    );
+                }
                 Ok(
                     json!({"message":format!("Processo iniciado ({pid}). Corrida ainda não verificada.")}),
                 )
@@ -1631,6 +1808,24 @@ fn browse(req: Request, body: &str, parent: &DialogParent) {
             ),
             &["dat"][..],
         )),
+        Some("fsr-library") => Some((
+            crate::language::pick(
+                &language,
+                "Provedor FFX (.so)",
+                "FFX provider (.so)",
+                "Proveedor FFX (.so)",
+            ),
+            &["so"][..],
+        )),
+        Some("dxc") => Some((
+            crate::language::pick(
+                &language,
+                "Compilador DXC",
+                "DXC compiler",
+                "Compilador DXC",
+            ),
+            &["*"][..],
+        )),
         _ => None,
     };
     let title = value["title"]
@@ -1783,6 +1978,24 @@ pub fn serve(mut app: App, server: Server, authority: String, url: String, token
                 200,
                 include_str!("../web/installation.css").into(),
                 "text/css; charset=utf-8",
+            );
+            continue;
+        }
+        if method == Method::Get && path == "/fsr.css" {
+            response(
+                req,
+                200,
+                include_str!("../web/fsr.css").into(),
+                "text/css; charset=utf-8",
+            );
+            continue;
+        }
+        if method == Method::Get && path == "/fsr.js" {
+            response(
+                req,
+                200,
+                include_str!("../web/fsr.js").into(),
+                "text/javascript; charset=utf-8",
             );
             continue;
         }
@@ -2104,6 +2317,41 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn fsr_settings_route_persists_and_rejects_the_unavailable_mlfi_mode() {
+        let root = std::env::temp_dir().join(format!("mk8-fsr-route-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone(), root.clone(), Config::default(), None);
+        let provider = if cfg!(windows) {
+            r"C:\\fsr\\provider.dll"
+        } else {
+            "/opt/fsr.so"
+        };
+        let body = format!(
+            r#"{{"upscaling":"3.1.6","provider_lib":"{provider}","frame_generation":"fsr3","dxc":"/opt/dxc","legacy_abi":true}}"#
+        );
+        let value = app
+            .handle(&Method::Post, "/api/fsr/settings", &body)
+            .unwrap();
+        assert_eq!(value["settings"]["upscaling"], "3.1.6");
+        assert_eq!(value["settings"]["frame_generation"], "fsr3");
+        let settings = crate::fsr::read_settings(&root).unwrap();
+        assert_eq!(settings.upscaling, "3.1.6");
+        assert!(settings.legacy_abi);
+
+        let error = app
+            .handle(
+                &Method::Post,
+                "/api/fsr/settings",
+                r#"{"upscaling":"off","provider_lib":"","frame_generation":"fsr4","dxc":"","legacy_abi":false}"#,
+            )
+            .unwrap_err();
+        assert!(error.contains("FSR 4 MLFI"), "{error}");
+        assert_eq!(crate::fsr::read_settings(&root).unwrap(), settings);
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     struct LocalSteamFixture;
     impl steam::P2PBackend for LocalSteamFixture {
         fn local_user(&self) -> u64 {
@@ -2253,7 +2501,15 @@ mod tests {
         let root = std::env::temp_dir().join(format!("mk8-prepare-dlc-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("dlc.json"), b"previous preference").unwrap();
-        let mut app = App::new(root.clone(), root.clone(), Config::default(), None);
+        let config = Config {
+            prod_keys: root
+                .join("missing-keys/prod.keys")
+                .to_string_lossy()
+                .into_owned(),
+            ..Config::default()
+        };
+        assert!(!Path::new(&config.prod_keys).exists());
+        let mut app = App::new(root.clone(), root.clone(), config, None);
         // A previous candidate must not start the new import while tools install.
         app.prepare_after_setup = true;
         app.prepare_dlc = Some(root.join("optional.nsp"));
@@ -2304,6 +2560,7 @@ mod tests {
             dlc_supported: false,
             pack_supported: false,
             cups_supported: false,
+            nextendo_supported: false,
         };
         save(&root.join("candidate.json"), &install).unwrap();
         let mut app = App::new(root.clone(), root.clone(), Config::default(), None);

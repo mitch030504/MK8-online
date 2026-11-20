@@ -19,12 +19,13 @@ BUILD = TARGET / "package"
 MANIFEST = ROOT / "upstream/manifests/smm2recomp.json"
 WINDOWS = os.name == "nt"
 LAUNCHER = "Launcher.exe" if WINDOWS else "Launcher"
-SOURCE_EXTENSIONS = {".c", ".inc", ".json", ".mk", ".ps1", ".py", ".txt", ".cs"}
+SOURCE_EXTENSIONS = {".c", ".h", ".inc", ".json", ".mk", ".ps1", ".py", ".txt", ".cs"}
 
 
 def payload_files():
     yield ROOT / "LICENSE"
     yield MANIFEST
+    yield ROOT / "toolchain/mii_assembly.html"
     importer = ROOT / "tools/mk8-import"
     for name in ("mk8-import.dll", "mk8-import.runtimeconfig.json", "LibHac.dll", "build-sha256.txt"):
         yield importer / name
@@ -37,6 +38,26 @@ def payload_files():
         for path in sorted((ROOT / folder).rglob("*")):
             if path.is_file() and path.suffix in SOURCE_EXTENSIONS:
                 yield path
+    if not WINDOWS:
+        # Linux builds the host runtime from these sources after the user supplies the game. host.py compiles every
+        # runtime/mk8/*.cpp (its headers ship with the runtime sources above), including the FSR bridge, frame
+        # generation, DLSS/NGX and MIT FFX headers, not just fsr.cpp.
+        for path in sorted((ROOT / "runtime/mk8").rglob("*.cpp")):
+            yield path
+        yield ROOT / "runtime/mk8/graphics/ffx/LICENSE"
+        # The launcher builds the optional FSR providers locally from the user's own MIT-licensed SDK download, so
+        # the build scripts and their C/C++ scaffolding must ship in the payload (they contain no AMD binaries).
+        for name in ("build_fg_provider.py", "gen_fg_blobs.py", "build_upscaler_provider.py",
+                     "gen_upscaler_blobs.py", "fetch_vendor_sdk.py", "build_fsr4_provider.py"):
+            yield ROOT / "tools" / name
+        # The vendored GPL-3.0 FSR 4.1.2 port the launcher builds one-click (sources only, no AMD assets).
+        for path in sorted((ROOT / "tools" / "fsr4-linux").rglob("*")):
+            if path.is_file() and "__pycache__" not in path.parts:
+                yield path
+        for folder in ("fg-linux", "fg-linux-upscaler"):
+            for path in sorted((ROOT / "tools" / folder).rglob("*")):
+                if path.is_file() and "__pycache__" not in path.parts:
+                    yield path
     if WINDOWS:
         # The runtime executable built from these same sources (scripts/prebuild-host.py); a build checks its key.
         for name in ("mk8drecomp.exe", "mk8drecomp.dll.a", "manifest.json"):
@@ -86,6 +107,19 @@ def main():
     )
     launcher = OUTPUT / LAUNCHER
     shutil.copy2(BUILD / "release" / LAUNCHER, launcher)
+    if WINDOWS:
+        # A separate archive opts into sibling storage without changing the setup executable's behavior.
+        with ZipFile(OUTPUT / "MK8-online-portable.zip", "w", ZIP_DEFLATED) as archive:
+            archive.write(launcher, LAUNCHER)
+            archive.writestr("portable.txt", "MK8-online portable mode\n")
+            archive.write(ROOT / "LICENSE", "LICENSE")
+            archive.writestr("README.txt", "Extract to a writable folder. Run Launcher.exe to prepare your own game files.\n"
+                             "Run Launcher.exe --play to start an already prepared game without the launcher window.\n"
+                             "Data is stored in portable/. Keep this folder when updating Launcher.exe.\n"
+                             "Open this version once before moving it. Close all MK8 processes, then move the whole folder.\n"
+                             "Internal paths are repaired automatically on next start; metadata backups are retained.\n"
+                             "Files selected outside portable/ are external dependencies: include them inside the tree before preparing.\n"
+                             "Windows x64 only; game files and keys are not included.\n")
     print(launcher)
 
 
