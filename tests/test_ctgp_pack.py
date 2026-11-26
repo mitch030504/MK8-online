@@ -10,10 +10,11 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+GAME_MENU = Path(os.environ.get('MK8_TEST_DATA', ROOT/'local'))/'imports/mk8-4.0.1/romfs/UI/cmn/menu.sarc'
 sys.path.insert(0, str(ROOT/'toolchain'))
 import ctgp_pack as P
 import import_ctgp
-from native import DEFAULT_COMPILER, compiler_env
+from native import DEFAULT_COMPILER, TARGET_FLAGS, cc, compiler_env
 
 TAG = '\x0e\x00\x02\x02Z'
 END = '\x0e\x00\x02\x02d'
@@ -241,9 +242,9 @@ class CtgpPackTests(unittest.TestCase):
         with self.assertRaises(P.PackError):
             P.flan_add_pattern(base, 'P_Other_00', ['x'], 25)
 
-    @unittest.skipUnless((ROOT/'local/imports/mk8-4.0.1/romfs/UI/cmn/menu.sarc').is_file(), 'MK8 4.0.1 RomFS required')
+    @unittest.skipUnless(GAME_MENU.is_file(), 'MK8 4.0.1 RomFS required')
     def test_cup_icon_textures_are_added_to_the_games_bntx(self):
-        menu = P.sarc_read((ROOT/'local/imports/mk8-4.0.1/romfs/UI/cmn/menu.sarc').read_bytes())
+        menu = P.sarc_read(GAME_MENU.read_bytes())
         archive = next(b for n, _, _, b, _ in menu['files'] if n == 'mn_L_CupSlctBtn_00.szs')
         bntx = next(f[3] for f in P.sarc_read(P.yaz0_decode(archive))['files'] if f[3][:4] == b'BNTX')
         same = P.bntx_add_textures(bntx, [])  # (the same file: only the _RLT's encoding may differ)
@@ -558,10 +559,29 @@ class CtgpPackTests(unittest.TestCase):
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
+#ifndef _WIN32
+#define _putenv_s(name, value) (*(value) ? setenv(name, value, 1) : unsetenv(name))
+#endif
 int fatal_calls; char logged[2048];
+static const char *settings;
+size_t usermods_overlay(char *out,size_t size) { out[0]=0; return 0; }
+bool usermods_find(const char *rel,char *out,size_t size) { return false; }
+bool mk8_nextendo_enabled(void) { return false; }
+const char *mk8_settings_romfs_overlay(void) { return settings; }
+static bool prepared;
+bool plat_exe_path(char *out, size_t size) {
+    const char path[]="./harness.exe";
+    if (!prepared || size < sizeof path) return false;
+    memcpy(out,path,sizeof path); return true;
+}
+bool mk8_settings_layout_available(void);
+bool mk8_settings_layout_unavailable(void);
+bool mk8_controller_layout_available(void);
 const char *mk8_romfs_overlay_from(const char *value);
 const char *game_romfs_overlay(void);
 int main(int argc, char **argv) {
+    if (mk8_settings_layout_available() || mk8_settings_layout_unavailable()) return 15;
     if (mk8_romfs_overlay_from(NULL) || mk8_romfs_overlay_from("")) return 1;          // no pack
     if (strcmp(mk8_romfs_overlay_from(argv[1]), argv[1])) return 2;                     // a folder
     if (*mk8_romfs_overlay_from(argv[2]) || *mk8_romfs_overlay_from("nowhere")) return 3;  // a file / missing
@@ -570,15 +590,45 @@ int main(int argc, char **argv) {
     _putenv_s("MK8_ROMFS_OVERLAY", argv[2]);
     game_romfs_overlay();
     if (fatal_calls != 1) return 5;  // an invalid pack stops the game instead of opening the base game silently
+    fatal_calls = 0;
+    _putenv_s("MK8_ROMFS_OVERLAY", "");
+    if (game_romfs_overlay() || !mk8_settings_layout_unavailable()) return 6;
+    settings = "combined-settings";
+    if (strcmp(game_romfs_overlay(), settings) || !mk8_settings_layout_available() || mk8_settings_layout_unavailable()) return 7;
+    _putenv_s("MK8_ROMFS_OVERLAY", argv[1]);
+    _putenv_s("MK8_SETTINGS_ROMFS", settings);
+    char expected[8192]; snprintf(expected, sizeof expected, "%s\n%s", argv[1], settings);
+    if (strcmp(game_romfs_overlay(), expected) || fatal_calls) return 8;
+    _putenv_s("MK8_SETTINGS_ROMFS", "");
+    if (strcmp(game_romfs_overlay(),expected) || !mk8_settings_layout_available()) return 9;
+    _putenv_s("MK8_ROMFS_OVERLAY", "custom-pack");
+    if (strcmp(game_romfs_overlay(),"custom-pack") || mk8_settings_layout_available()) return 14;
+    settings=NULL; prepared=true; fatal_calls=0;
+    _putenv_s("MK8_ROMFS_OVERLAY", "");
+    _putenv_s("RECOMP_MOD_DIR", "");
+    const char *roster="./controller-menu/romfs";
+    if (strcmp(game_romfs_overlay(),roster) || !mk8_controller_layout_available()) return 10;
+    _putenv_s("MK8_ROMFS_OVERLAY", argv[1]);
+    snprintf(expected,sizeof expected,"%s\n%s",roster,argv[1]);
+    if (strcmp(game_romfs_overlay(),expected) || !mk8_controller_layout_available()) return 11;
+    _putenv_s("MK8_ROMFS_OVERLAY", "custom-pack");
+    if (strcmp(game_romfs_overlay(),"custom-pack") || mk8_controller_layout_available()) return 12;
+    _putenv_s("MK8_ROMFS_OVERLAY", "");
+    _putenv_s("RECOMP_MOD_DIR", "custom-mod");
+    if (game_romfs_overlay() || mk8_controller_layout_available() || fatal_calls) return 13;
     return 0;
 }''', encoding='utf-8')
             exe = out/'harness.exe'
-            subprocess.run([str(DEFAULT_COMPILER), 'cc', '-target', 'x86_64-windows-gnu', '-O1', '-I', str(out/'inc'),
+            subprocess.run([*cc(), *TARGET_FLAGS, '-O1', '-I', str(out/'inc'),
                             str(harness), str(ROOT/'runtime/mk8/support/romfs_overlay.c'), '-o', str(exe)],
                            env=compiler_env(), check=True, capture_output=True)
             (out/'pack').mkdir()
             (out/'file.bin').write_bytes(b'x')
-            result = subprocess.run([str(exe), str(out/'pack'), str(out/'file.bin')], capture_output=True, timeout=60)
+            for overlay in ('controller-menu/romfs', 'custom-pack', 'custom-mod/romfs'):
+                common = out/overlay/'UI/cmn/common.sarc'
+                common.parent.mkdir(parents=True)
+                common.write_bytes(b'test')
+            result = subprocess.run([str(exe), str(out/'pack'), str(out/'file.bin')], cwd=out, capture_output=True, timeout=60)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 

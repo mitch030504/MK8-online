@@ -41,6 +41,10 @@ def linux_libraries():
 def prepare_host_sources(source, output):
     runtime = output/'runtime'
     shutil.copytree(source/'runtime', runtime, dirs_exist_ok=True)
+    from packed_color import prepare as prepare_packed_color
+    from scene_scale import prepare as prepare_scene_scale
+    prepare_packed_color(runtime)
+    prepare_scene_scale(runtime)
     for dependency in ('zstd', 'bcdec'):
         shutil.copytree(source/'third_party'/dependency, output/'third_party'/dependency, dirs_exist_ok=True)
     settings = runtime/'settings.c'
@@ -191,6 +195,33 @@ def prepare_host_sources(source, output):
     if text.count(old) != 1:
         raise ValueError('Mii IsUpdated boundary changed upstream')
     text = text.replace(old, '    case 0: OUT(uint8_t, 0) = mk8_mii_updated; mk8_mii_updated = false; resp_size(resp, 1); break;\n    case 1: case 20:')
+    old = '    case 22: break;'
+    if text.count(old) != 1:
+        raise ValueError('Mii refresh/index boundary changed upstream')
+    text = text.replace(old, '''    case 5: case 21: { // UpdateLatest / GetIndex for the local database entry.
+        if (!req->data || req->data_size < (req->cmd == 5 ? 0x5c : 0x58)) {
+            resp->result = 0x27e; break; // InvalidArgument
+        }
+        if (!mk8_charinfo_valid(req->data)) {
+            resp->result = 0xc87e; break; // InvalidCharInfo
+        }
+        uint8_t current[0x58];
+        bool found = mk8_mii_get(current, sizeof current, sizeof current, 1, one_mii()) == 1
+            && !memcmp(current, req->data, 16);
+        if (req->cmd == 21) {
+            OUT(int32_t, 0) = found ? 0 : -1;
+            resp_size(resp, 4);
+            if (!found) resp->result = 0x87e; // NotFound
+        } else if (!(IN(uint32_t, 0x58) & 1) || !found || current[0x2b] != req->data[0x2b]) {
+            resp->result = 0x87e;
+        } else {
+            memcpy(resp->data, current, sizeof current);
+            resp_size(resp, sizeof current);
+            if (!memcmp(current, req->data, sizeof current)) resp->result = 0x67e; // NotUpdated
+        }
+        break;
+    }
+'''+old)
     mii.write_text(text+'\n'+(ROOT/'runtime/mk8/mii/mii_editor.inc').read_text(encoding='utf-8'), encoding='utf-8')
     from mii_applet import adapt as adapt_mii_applet
     fs = runtime/'services/fs.c'
@@ -206,6 +237,8 @@ def prepare_host_sources(source, output):
     fs.write_text(text, encoding='utf-8')
     am = runtime/'services/am.c'
     am.write_text(adapt_mii_applet(am.read_text(encoding='utf-8')), encoding='utf-8')
+    from desired_language import prepare as prepare_desired_language
+    prepare_desired_language(runtime)
     from manual_applet import prepare as prepare_manual_applet
     prepare_manual_applet(runtime)
     movie = runtime/'hle/movie.c'
@@ -247,15 +280,19 @@ def prepare_host_sources(source, output):
         raise ValueError('TLD4S translator boundary changed')
     text = text.replace(boundary, (ROOT/'runtime/mk8/graphics/maxwell_gather.inc').read_text(encoding='utf-8')+'\n'+boundary)
     text = text.replace(opcode, '    } else if (OPM(0xdf00000000000000ull, 0xffc0000000000000ull)) {  // TLD4S F32\n        mk8_emit_tld4s(c, w);\n'+opcode)
-    # Point draws without a guest size use the default pixel size. Vulkan 1.3 requires
-    # the vertex shader to write it even for point topology selected dynamically.
-    point_size = '        if (info->writes_point_size) sp(&s, "  gl_PointSize = 0.0f;\\n");'
-    if text.count(point_size) != 1:
-        raise ValueError('Vulkan vertex point-size emission changed')
-    text = text.replace(point_size, '        sp(&s, "  gl_PointSize = 1.0f;\\n");')
+    # (Point lists without a shader-written size: toolchain/point_size.py writes the guest's fixed
+    # size through a specialization constant, which covers the Linux point-size fix as well.)
     translator.write_text(text, encoding='utf-8')
     from maxwell_mip_query import prepare as prepare_maxwell_mip_query
     prepare_maxwell_mip_query(runtime)
+    from interpolation import prepare as prepare_interpolation
+    prepare_interpolation(runtime)
+    from texture_size_hoist import prepare as prepare_texture_size_hoist
+    prepare_texture_size_hoist(runtime)
+    from vulkan_driver_log import prepare as prepare_vulkan_driver_log
+    prepare_vulkan_driver_log(runtime)
+    from castle_bloom import prepare as prepare_castle_bloom
+    prepare_castle_bloom(runtime)
     from texture_lifetime import prepare as prepare_texture_lifetime
     prepare_texture_lifetime(runtime)
     from gpu_sync import prepare as prepare_gpu_sync
@@ -274,8 +311,19 @@ def prepare_host_sources(source, output):
     prepare_texture_init(runtime)
     from texture_pool import prepare as prepare_texture_pool
     prepare_texture_pool(runtime)
+    from shadow_fallback import prepare as prepare_shadow_fallback
+    prepare_shadow_fallback(runtime)
     from bc_render import prepare as prepare_bc_render
     prepare_bc_render(runtime)
+    # The Vulkan translator already emits a tint uniform for floating-point RGB outputs.
+    executor = runtime/'nvn/vulkan/exec.c'
+    text = executor.read_text(encoding='utf-8')
+    tint = '            bi[n] = ubo_span(copy_dedupe(DEDUPE_TINT, tint ? tint : zero, 32, 256), 32);'
+    if text.count(tint) != 1:
+        raise ValueError('Vulkan fragment tint upload boundary changed')
+    mask = ROOT/'runtime/mk8/graphics/bloom_mask.h'
+    executor.write_text(mask.read_text(encoding='utf-8') + '\n' + text.replace(tint,
+        '            if (stage == 1) tint = mk8_bloom_tint(mk8_bloom_enabled(), g_cur_fs_hash, tint);\n' + tint), encoding='utf-8')
     from split_screen import prepare as prepare_split_screen
     prepare_split_screen(runtime)
     from online_notice import prepare as prepare_online_notice
@@ -292,6 +340,8 @@ def prepare_host_sources(source, output):
     prepare_shader_budget(runtime)
     from shader_storage import prepare as prepare_shader_storage
     prepare_shader_storage(runtime)
+    from fsr import prepare as prepare_fsr
+    prepare_fsr(runtime)
     from async_submit import prepare as prepare_async_submit
     prepare_async_submit(runtime)
     from texture_release_thread import prepare as prepare_texture_release_thread
@@ -302,10 +352,16 @@ def prepare_host_sources(source, output):
     prepare_descriptor_lifetime(runtime)
     from pipeline_cache_save import prepare as prepare_pipeline_cache_save
     prepare_pipeline_cache_save(runtime)
+    from point_size import prepare as prepare_point_size
+    prepare_point_size(runtime)
+    from pipeline_warm import prepare as prepare_pipeline_warm
+    prepare_pipeline_warm(runtime)
     from ipc_core_release import prepare as prepare_ipc_core_release
     prepare_ipc_core_release(runtime)
     from save_file_close import prepare as prepare_save_file_close
     prepare_save_file_close(runtime)
+    from save_data import prepare as prepare_save_data
+    prepare_save_data(runtime)
     from vram_trace import prepare as prepare_vram_trace
     prepare_vram_trace(runtime)
     from auto_lan import prepare as prepare_auto_lan
@@ -322,12 +378,62 @@ def prepare_host_sources(source, output):
     prepare_vertex_cache_age(runtime)
     from texture_retire import prepare as prepare_texture_retire
     prepare_texture_retire(runtime)
+    from compact_commands import prepare as prepare_compact_commands
+    prepare_compact_commands(runtime)
+    from output_aspect import prepare as prepare_output_aspect
+    prepare_output_aspect(runtime)
+    from depth_bias import prepare as prepare_depth_bias
+    prepare_depth_bias(runtime)
+    from snapshot_memory import prepare as prepare_snapshot_memory
+    prepare_snapshot_memory(runtime)
+    from depth_clamp import prepare as prepare_depth_clamp
+    prepare_depth_clamp(runtime)
+    # Local Vulkan-path experiments run after the upstream runtime patches above.
+    # toolchain/view_batch.py (parallel attachment views, Linux branch) is not applied: it predates the
+    # view-table and attachment changes of toolchain/shadow_fallback.py (#105) and bc_render.py (#104),
+    # and its worker threads would also create the R32 shadow copies. It needs a port onto those first.
+    from gmem_cap import prepare as prepare_gmem_cap
+    prepare_gmem_cap(runtime)
+    from gmem_map import prepare as prepare_gmem_map
+    prepare_gmem_map(runtime)
+    from vcache_above import prepare as prepare_vcache_above
+    prepare_vcache_above(runtime)
+    from submit_profile import prepare as prepare_submit_profile
+    prepare_submit_profile(runtime)
+    from acquire_bound import prepare as prepare_acquire_bound
+    prepare_acquire_bound(runtime)
+    from prefetch_nowait import prepare as prepare_prefetch_nowait
+    prepare_prefetch_nowait(runtime)
     from controller_applet import prepare as prepare_controller_applet
     prepare_controller_applet(runtime)
+    from controller_discovery import prepare as prepare_controller_discovery
+    prepare_controller_discovery(runtime)
+    from controller_rumble import prepare as prepare_controller_rumble
+    prepare_controller_rumble(runtime)
+    from controller_sensors import prepare as prepare_controller_sensors
+    prepare_controller_sensors(runtime)
+    from controller_motion import prepare as prepare_controller_motion
+    prepare_controller_motion(runtime)
     from texture_readback import prepare as prepare_texture_readback
     prepare_texture_readback(runtime)
     from entry_trace import prepare as prepare_entry_trace  # (read-only tracing for reverse engineering)
     prepare_entry_trace(runtime)
+    # Runs last: it wraps the acquire/present calls that the WSI profiling patches above instrument.
+    from fsr_fg import prepare as prepare_fsr_fg
+    prepare_fsr_fg(runtime)
+    # DLSS SR/FG: enable the NGX instance/device extensions before vkCreateDevice. Inert
+    # when MK8_DLSS and MK8_DLSS_FG are unset/0; runs before the DLSS-G low-latency step so
+    # the FSR FG/MLFI extension list is already in place and is not reordered.
+    from dlss import prepare as prepare_dlss
+    prepare_dlss(runtime)
+    # DLSS-G: low-latency device/swapchain gating and the final-image accessor. Gated on
+    # MK8_DLSS_FG; it does not touch the FSR paths when the variable is unset.
+    from dlss_fg import prepare as prepare_dlss_fg
+    prepare_dlss_fg(runtime)
+    # Mesa 27 initialises RADV's PS-epilog cache only for extended-dynamic-state-3 features;
+    # enable one (no pipeline change here) so dynamic depth-test draws do not null-deref.
+    from radv_epilog import prepare as prepare_radv_epilog
+    prepare_radv_epilog(runtime)
     device = runtime/'nvn/vulkan/device.c'
     text = device.read_text(encoding='utf-8')
     boundary = '    VK_CHECK(vmaCreateAllocator(&ai, &g_vk.vma));'
@@ -340,10 +446,27 @@ def prepare_host_sources(source, output):
     boundary = '        tabs_body(scale, true, NULL);'
     if text.count(boundary) != 1:
         raise ValueError('Runtime room menu boundary changed')
-    text = text.replace(boundary, '        if (mk8_room_menu_available() && ImGui::Button("Salas com amigos")) mk8_open_room_menu();\n'
-                        '        if (mk8_mii_menu_available() && ImGui::Button("Perfil Mii")) mk8_open_mii_menu();\n' + boundary)
-    menu.write_text('extern "C" bool mk8_mii_menu_available(void);\nextern "C" void mk8_open_mii_menu(void);\n'
-                   'extern "C" bool mk8_room_menu_available(void);\nextern "C" void mk8_open_room_menu(void);\n' + text, encoding='utf-8')
+    text = text.replace(boundary, '        mk8_draw_launcher_actions(mk8_menu_language());\n' + boundary)
+    hub = runtime/'ui/mk8_hub.h'
+    shutil.copyfile(ROOT/'runtime/mk8/ui/hub.h', hub)
+    shutil.copyfile(ROOT/'runtime/mk8/ui/menu_language.h', hub.with_name('menu_language.h'))
+    shutil.copyfile(ROOT/'runtime/mk8/ui/menu_play.h', hub.with_name('menu_play.h'))
+    shutil.copyfile(ROOT/'runtime/mk8/ui/menu_nextendo.h', hub.with_name('menu_nextendo.h'))
+    shutil.copyfile(ROOT/'runtime/mk8/ui/menu_launcher_actions.h', hub.with_name('menu_launcher_actions.h'))
+    boundary = 'static bool g_drew;  // the last menu_render drew (menu_redraw draws it again)'
+    if text.count(boundary) != 1:
+        raise ValueError('MK8 hub declaration boundary changed')
+    text = text.replace(boundary, '#include "mk8_hub.h"\n' + boundary)
+    boundary = '    const uint8_t *ov_img = game_overlay_image(&ov_w, &ov_h, &ov_full, &ov_seq);'
+    if text.count(boundary) != 1:
+        raise ValueError('Nextendo startup notice boundary changed')
+    text = text.replace(boundary, '    mk8_nextendo_start_notice();\n' + boundary)
+    boundary = '    if (open) {\n        // dim the game behind the menu'
+    if text.count(boundary) != 1:
+        raise ValueError('MK8 hub render boundary changed')
+    text = text.replace(boundary, '    if (open && mk8_hub_enabled()) mk8_hub_draw(scale);\n'
+                        '    if (open && !mk8_hub_enabled()) {\n        // dim the game behind the menu')
+    menu.write_text(text, encoding='utf-8')
     kernel = runtime/'kernel.c'
     text = kernel.read_text(encoding='utf-8')
     stack = '    pthread_attr_setstacksize(&attr, 256ull << 20);  // guest recursion runs on the host stack'
@@ -375,6 +498,9 @@ def prepare_host_sources(source, output):
     kernel.write_text(text, encoding='utf-8')
     from core_preempt import prepare as prepare_core_preempt
     prepare_core_preempt(runtime)
+    # Last of the renderer patches: their option reads included (toolchain/env_cache.py, #133).
+    from env_cache import prepare as prepare_env_cache
+    prepare_env_cache(runtime)
     if not WINDOWS:
         platform = runtime/'platform/linux.c'
         text = platform.read_text(encoding='utf-8')
@@ -408,12 +534,30 @@ def prepare_host_sources(source, output):
     boundary = 'static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *ep) {\n    EXCEPTION_RECORD *er = ep->ExceptionRecord;\n'
     if text.count(boundary) != 1:
         raise ValueError('Windows exception handler boundary changed')
-    text = text.replace(boundary, boundary + '''    // The legacy debugger thread-name notification can escape SDL's fallback on Windows.
-    if (er->ExceptionCode == 0x406D1388 && !(er->ExceptionFlags & EXCEPTION_NONCONTINUABLE) &&
-        er->NumberParameters >= 2 && (DWORD)er->ExceptionInformation[0] == 0x1000)
-        return EXCEPTION_CONTINUE_EXECUTION;
-''')
+    notification = '''static bool mk8_thread_name_notification(const EXCEPTION_RECORD *er) {
+    return er->ExceptionCode == 0x406D1388 && !(er->ExceptionFlags & EXCEPTION_NONCONTINUABLE) &&
+           er->NumberParameters >= 2 && (DWORD)er->ExceptionInformation[0] == 0x1000;
+}
+
+'''
+    resume = '    if (mk8_thread_name_notification(er)) return EXCEPTION_CONTINUE_EXECUTION;\n'
+    text = text.replace(boundary, notification + boundary + resume)
+    # SDL's legacy thread-name notification can also reach the top-level Windows crash filter.
+    terminal = 'static LONG WINAPI unhandled_filter(EXCEPTION_POINTERS *ep) {\n    EXCEPTION_RECORD *er = ep->ExceptionRecord;\n'
+    if text.count(terminal) != 1:
+        raise ValueError('Windows crash filter boundary changed')
+    text = text.replace(terminal, terminal + resume)
     windows.write_text(text, encoding='utf-8')
+    from settings_menu import prepare as prepare_settings_menu
+    prepare_settings_menu(runtime)
+    from joycon_modes import prepare as prepare_joycon_modes
+    prepare_joycon_modes(runtime)
+    from mixed_gamepads import prepare as prepare_mixed_gamepads
+    prepare_mixed_gamepads(runtime)
+    from romfs_paths import prepare as prepare_romfs_paths
+    prepare_romfs_paths(runtime)
+    from castle_blur import prepare as prepare_castle_blur
+    prepare_castle_blur(runtime)
     return runtime
 
 
@@ -422,6 +566,12 @@ def run(args, log, env):
     log.write_bytes(result.stdout + result.stderr)
     if result.returncode:
         raise ValueError(f'{log.name}:\n' + result.stderr.decode('utf-8', 'replace')[-6000:])
+
+
+def prepared_headers(runtime):
+    # Prepared C/C++ units include both declarations and implementation fragments.
+    return {'prepared/'+str(p.relative_to(runtime)): digest(p)
+            for pattern in ('*.h', '*.inc') for p in runtime.rglob(pattern)}
 
 
 def build_host(source, output, workers=None, game_library=None):
@@ -439,12 +589,20 @@ def build_host(source, output, workers=None, game_library=None):
     # The upstream Makefile replaces non-ASCII bytes in this legacy shader comment text.
     hlsl = (source/'third_party/smaa/SMAA.hlsl').read_bytes().decode('ascii', errors='replace').replace('\ufffd', '?')
     (inc/'smaa_hlsl.inc').write_text('\n'.join(json.dumps(line+'\n', ensure_ascii=True) for line in hlsl.splitlines()), encoding='utf-8')
+    # The Vulkan shim maps the game's vulkan-1 imports onto the host loader; only the Windows build
+    # links it (the Linux build resolves Vulkan directly and has no DEPS/ucrt64 headers).
+    shim = None
     if WINDOWS:
         shim = output/'vk_shim.c'
         run([sys.executable, source/'tools/gen_vk_shim.py', DEPS/'include', source/'runtime/platform/vulkan-1.exports', shim], output/'vk-shim.log', env)
+        patch_vk_shim(shim)
         # Export only the shared runtime ABI used by the generated game code.
         exported = ['rt_dispatch', 'rt_svc', 'rt_brk', 'rt_udf', 'rt_ticks', 'fnprof_hit', 'g_fnprof DATA', 'mk8_no_mii_renderer', 'mk8_setjmp_arm', 'mk8_yaz0_loop', 'mk8_cup_entry', 'mk8_cup_select', 'mk8_cup_select_gp', 'mk8_cup_by_course', 'mk8_cup_by_slot', 'mk8_course_folder', 'mk8_cups_built', 'mk8_cup_page_id', 'mk8_cup_page_turn', 'mk8_cup_owned', 'mk8_cup_label', 'mk8_stream_path', 'mk8_course_pictures', 'mk8_course_picture_places', 'mk8_course_picture', 'mk8_panel_record', 'mk8_panel_picture', 'mk8_course_picture_id']
         exports = output/'exports.def'
+        exported.append('mk8_split_race_full_speed')
+        exported.extend(['mk8_ultrawide_camera', 'mk8_driver_camera_distance', 'mk8_ultrawide_hud', 'mk8_settings_top_event',
+                         'mk8_settings_navigation', 'mk8_settings_shared_build', 'mk8_settings_fader_build', 'mk8_settings_page_frame',
+                         'mk8_guest_lan_start', 'mk8_guest_lan_hide_boot_logo', 'mk8_guest_lan_hold_boot'])
         exports.write_text('LIBRARY mk8drecomp.exe\nEXPORTS\n'+'\n'.join(exported)+'\n', encoding='utf-8')
         export_source = output/'mk8_exports.c'
         directives = ''.join(' -export:'+name.replace(' DATA', ',data') for name in exported)
@@ -471,7 +629,11 @@ def build_host(source, output, workers=None, game_library=None):
                     'runtime/nvn/vulkan/*.cpp', 'runtime/ui/*.mm', 'third_party/mbedtls/library/*.c', 'games/mk8d/*.c']:
         sources.extend(sorted(source.glob(pattern)))
     sources = [p for p in sources if p.name not in ('iosbuild.c', 'nextendo_ios.mm', 'launcher.mm', 'secure_store.c')]
-    sources.extend(sorted((ROOT/'runtime/mk8').rglob('*.c')))
+    # support/steam_gamepads.c is Windows-only (GameInput); Linux builds the portable fallback in
+    # support/steam_gamepads_linux.c instead. Everything else compiles on both platforms.
+    windows_only = set() if WINDOWS else {'steam_gamepads.c'}
+    sources.extend(sorted(p for p in (ROOT/'runtime/mk8').rglob('*.c') if p.name not in windows_only))
+    sources.extend(sorted(p for p in (ROOT/'runtime/mk8').rglob('*.cpp') if p.name not in windows_only))
     if WINDOWS:
         sources += [source/'runtime/platform/windows.c', export_source, shim]
     else:
@@ -480,16 +642,23 @@ def build_host(source, output, workers=None, game_library=None):
     sources += [source/'third_party/imgui'/name for name in ['imgui.cpp', 'imgui_draw.cpp', 'imgui_tables.cpp', 'imgui_widgets.cpp', 'backends/imgui_impl_sdl3.cpp', 'backends/imgui_impl_vulkan.cpp']]
     sources = [runtime/p.relative_to(source/'runtime') if p.is_relative_to(source/'runtime') else p for p in sources]
     headers = {str(p.relative_to(source)): digest(p) for folder in ['runtime', 'third_party', 'games/mk8d'] for p in (source/folder).rglob('*.h')}
-    headers.update({'prepared/'+str(p.relative_to(runtime)): digest(p) for p in runtime.rglob('*.h')})
+    headers.update(prepared_headers(runtime))
+    headers.update({str(p.relative_to(ROOT)): digest(p) for p in (ROOT/'runtime/mk8').rglob('*.h')})
+    # Linux uses the SDK/pkg-config headers, not the Windows ucrt64 tree, so record their versions and
+    # the one header our overlay compiles against directly.
     dep_headers = ({str(p.relative_to(DEPS)): digest(p) for p in (DEPS/'include').rglob('*.h')}
                    if WINDOWS else {'pkg-config': linux_pkg_config('--modversion'),
-                         'vma': digest(dep_include/'vk_mem_alloc.h')})
+                                    'vma': digest(dep_include/'vk_mem_alloc.h')})
     environment = hashlib.sha256(json.dumps({'headers': headers, 'deps': dep_headers, 'smaa': digest(inc/'smaa_hlsl.inc'), 'compiler': digest(DEFAULT_COMPILER), 'flags': common}, sort_keys=True).encode()).hexdigest()
 
     def relative_of(src):
         return Path('runtime')/src.relative_to(runtime) if src.is_relative_to(runtime) else src.relative_to(source) if src.is_relative_to(source) else Path(src.name)
 
-    key = host_key({'headers': headers, 'deps': dep_headers, 'smaa': digest(inc/'smaa_hlsl.inc')}, common, sources, source, output) if WINDOWS else None
+    manifest = ROOT/'runtime/mk8/windows.manifest'
+    resource = manifest.with_suffix('.rc')
+    key = host_key({'headers': headers, 'deps': dep_headers, 'smaa': digest(inc/'smaa_hlsl.inc'),
+                    'windows_manifest': digest(manifest), 'resource': digest(resource)},
+                   common, sources, source, output) if WINDOWS else None
     prebuilt = use_prebuilt(key, output) if WINDOWS else None
     if prebuilt:
         copy_runtime_dlls(output)
@@ -533,10 +702,11 @@ def build_host(source, output, workers=None, game_library=None):
             run([pending, '--check-game-library', game_library], output/'game-abi.log', env)
         pending.replace(exe)
         return exe
-    run([DEFAULT_COMPILER, 'c++', '-target', 'x86_64-windows-gnu', '@'+str(rsp), '-o', exe,
+    run([DEFAULT_COMPILER, 'c++', '-target', 'x86_64-windows-gnu', '@'+str(rsp), resource,
+         '-o', exe,
          '-L'+str(DEPS/'lib'), '-Wl,--stack,268435456', '-Wl,--export-all-symbols',
          *(DEPS/'lib'/('lib'+lib+'.dll.a') for lib in ['SDL3', 'avformat', 'avcodec', 'avutil', 'swscale', 'shaderc_shared']),
-         *('-l'+lib for lib in ['winmm', 'ole32', 'shell32', 'comdlg32', 'uuid', 'ws2_32', 'bcrypt'])], output/'host-link.log', env)
+         *('-l'+lib for lib in ['winmm', 'ole32', 'shell32', 'comdlg32', 'uuid', 'ws2_32', 'bcrypt', 'advapi32'])], output/'host-link.log', env)
     run([DEFAULT_COMPILER, 'dlltool', '-m', 'i386:x86-64', '-d', exports, '-l', output/'mk8drecomp.dll.a'], output/'exports.log', env)
     copy_runtime_dlls(output)
     (output/'host-key.json').write_text(json.dumps({'key': key, 'files': {name: digest(output/name) for name in HOST_FILES}}, indent=2), encoding='utf-8')
@@ -576,6 +746,30 @@ def copy_runtime_dlls(output):
         target = output/dll.name
         if not target.is_file() or digest(target) != digest(dll):
             shutil.copy2(dll, target)
+
+
+def patch_vk_shim(shim):
+    """Issue #78: a vulkan-1.dll that another module (an overlay) loaded first answers the bare name, and the
+    instance then belongs to a loader SDL does not use: SDL_Vulkan_CreateSurface finds no vkCreateWin32SurfaceKHR.
+    The shim loads the library SDL is given (SDL_VULKAN_LIBRARY, set by the launcher) first."""
+    text = shim.read_text(encoding='utf-8')
+    boundary = '    if (!vk_shim_dll) vk_shim_dll = LoadLibraryA("vulkan-1.dll");\n'
+    if text.count(boundary) != 1:
+        raise ValueError('Vulkan loader shim boundary changed')
+    shim.write_text(text.replace(boundary, '''    if (!vk_shim_dll) {
+        static wchar_t path[32768];  // The loader SDL uses (SDL_VULKAN_LIBRARY, set by the launcher).
+        DWORD n = GetEnvironmentVariableW(L"SDL_VULKAN_LIBRARY", path, 32768);
+        if (n) {
+            if (n < 32768) vk_shim_dll = LoadLibraryW(path);
+            if (!vk_shim_dll) fprintf(stderr, "FATAL: Vulkan: could not load SDL_VULKAN_LIBRARY (Win32 %lu)\\n",
+                                      n < 32768 ? GetLastError() : ERROR_INSUFFICIENT_BUFFER);
+        } else {
+            vk_shim_dll = LoadLibraryA("vulkan-1.dll");
+        }
+        if (vk_shim_dll && (n = GetModuleFileNameW(vk_shim_dll, path, 32768)) && n < 32768)
+            fprintf(stderr, "[vk] loader %ls\\n", path);
+    }
+'''), encoding='utf-8')
 
 
 def host_key(inputs, flags, sources, source, output):

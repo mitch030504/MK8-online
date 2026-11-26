@@ -161,6 +161,8 @@ def build(config, local):
     if not WINDOWS:
         inputs["target"] = TARGET
     identity = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+    if os.name == 'nt':
+        validate_romfs_paths(config.get('romfs'), local/'game-data'/identity[:16]/'extracted/romfs')
     job = local / "builds" / identity
     job.mkdir(parents=True, exist_ok=True)
     # Keep imported code inputs separate from the user's original files.
@@ -206,6 +208,34 @@ def build(config, local):
     print(f"Runtime e ligação: {finished-native_at:.1f} s. Preparação total: {finished-started:.1f} s.", flush=True)
 
 
+def filesystem_path(path):
+    """Verbatim absolute path for Windows file I/O only. Manifests keep portable paths."""
+    path = Path(os.path.abspath(path))
+    if os.name != 'nt' or str(path).startswith('\\\\?\\'):
+        return path
+    name = str(path)
+    return Path('\\\\?\\UNC\\' + name[2:] if name.startswith('\\\\') else '\\\\?\\' + name)
+
+
+def validate_romfs_paths(source, destination):
+    if not source or not (filesystem_path(source)/'Course').is_dir():
+        raise ValueError('RomFS do MK8 ausente ou incompleto')
+    source, destination = filesystem_path(source), filesystem_path(destination)
+    for folder, dirs, files in os.walk(source, onerror=walk_error, followlinks=False):
+        parent = destination/Path(folder).relative_to(source)
+        for name in dirs:
+            if is_link(Path(folder)/name):
+                raise ValueError(f'Pasta de origem contém link: {Path(folder)/name}')
+        # Windows counts UTF-16 code units and the terminating NUL. The mirror
+        # also creates a temporary sibling before publishing each hard link.
+        longest = max((len(name.encode('utf-16-le')) // 2 for name in dirs + files), default=0)
+        if files:
+            longest = max(longest, len(f'.mk8-{os.getpid()}-{time.time_ns()}.pending'))
+        if len(str(parent).encode('utf-16-le')) // 2 + 1 + longest >= 32767:
+            raise ValueError(f'Caminho do RomFS excede o limite de caminho estendido do Windows em {parent}. '
+                             'Escolha uma pasta de dados mais curta.')
+
+
 def mirror(path, target, copy_ok=False):
     """Expose `target` at `path` as real folders with hard-linked files, never a junction.
 
@@ -216,7 +246,7 @@ def mirror(path, target, copy_ok=False):
     reparse points and take no extra space, but need the same volume: a small tree (`copy_ok`) is
     copied instead; a large one fails with the reason rather than copying gigabytes.
     """
-    path, target = Path(path), Path(target).resolve(strict=True)
+    path, target = filesystem_path(path), filesystem_path(target).resolve(strict=True)
     # Enumerate successfully before replacing or pruning anything. pathlib.rglob can
     # silently skip inaccessible directories, which must not be interpreted as deletion.
     sources = []
@@ -243,7 +273,8 @@ def mirror(path, target, copy_ok=False):
             if copy_ok and (a.st_size, a.st_mtime_ns) == (b.st_size, b.st_mtime_ns):
                 continue
         dst.parent.mkdir(parents=True, exist_ok=True)
-        pending = dst.with_name(dst.name + f'.pending-{os.getpid()}-{time.time_ns()}')
+        # Appending to a valid game filename can exceed Windows' component limit.
+        pending = dst.with_name(f'.mk8-{os.getpid()}-{time.time_ns()}.pending')
         try:
             os.link(src, pending)
         except OSError as error:
@@ -252,6 +283,10 @@ def mirror(path, target, copy_ok=False):
             if not unsupported:
                 raise
             if not copy_ok:
+                if Path(target.anchor).resolve() == Path(path.absolute().anchor).resolve():
+                    # Same drive: the file system has no hard links (FAT32/exFAT).
+                    raise ValueError(f'O disco {path.anchor} não aceita hard links (FAT32/exFAT). A pasta de dados '
+                                     f'precisa estar num disco NTFS: {error}') from error
                 raise ValueError(f'{target} precisa estar no mesmo disco da pasta de dados ({path.anchor}): {error}') from error
             shutil.copy2(src, pending)
         os.replace(pending, dst)
@@ -265,6 +300,59 @@ def mirror(path, target, copy_ok=False):
 def prepare_system_data(config, local):
     if config.get('fonts'):
         mirror(local/'user-no-mii/fonts', config['fonts'], copy_ok=True)
+
+
+def elf_undefined_symbols(path):
+    """Names of the undefined dynamic symbols of an ELF64 little-endian shared object (what it takes from the host)."""
+    import struct
+    data = Path(path).read_bytes()
+    if data[:6] != b'\x7fELF\x02\x01':
+        raise ValueError(f'{path} is not an ELF64 little-endian object')
+    shoff, = struct.unpack_from('<Q', data, 0x28)
+    shentsize, shnum = struct.unpack_from('<HH', data, 0x3a)
+    sections = [struct.unpack_from('<IIQQQQIIQQ', data, shoff + i * shentsize) for i in range(shnum)]
+    names = set()
+    for _, kind, _, _, offset, size, link, _, _, entsize in sections:
+        if kind != 11 or not entsize:  # SHT_DYNSYM
+            continue
+        strtab = sections[link][4]
+        for at in range(offset, offset + size, entsize):
+            name, _, _, shndx = struct.unpack_from('<IBBH', data, at)
+            if name and shndx == 0:  # SHN_UNDEF
+                names.add(data[strtab + name:data.index(b'\0', strtab + name)])
+    return names
+
+
+def guest_host_imports(files):
+    """Host functions the linked main module calls: the PE imports of mk8d-code-main.dll from mk8drecomp.exe on Windows,
+    the undefined dynamic symbols of mk8dgame.so on Linux (all modules in one object; #128). None without a module."""
+    record = files.get('mk8d-code-main.dll')
+    if record:
+        import pefile
+        with pefile.PE(record['path'], fast_load=True) as pe:
+            pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']])
+            return {symbol.name for module in getattr(pe, 'DIRECTORY_ENTRY_IMPORT', ())
+                    if module.dll.lower() == b'mk8drecomp.exe' for symbol in module.imports}
+    game = files.get('gamelib')
+    if game and game['path'].endswith('.so'):
+        try:
+            return elf_undefined_symbols(game['path'])
+        except (OSError, ValueError, struct.error, IndexError):
+            return None  # (not an ELF64 object: no capability is claimed)
+    return None
+
+
+def guest_has_split_screen_hook(files):
+    # --runtime-only and --finish can reuse guest objects from an earlier build.
+    imports = guest_host_imports(files)
+    return bool(imports) and b'mk8_split_race_full_speed' in imports
+
+
+def guest_has_direct_lan(files):
+    # A runtime-only build can reuse a main module without one or both boot callbacks.
+    imports = guest_host_imports(files)
+    required = {b'mk8_guest_lan_start', b'mk8_guest_lan_hide_boot_logo', b'mk8_guest_lan_hold_boot'}
+    return bool(imports) and required <= imports
 
 
 def finish(config, local, executable=None):
@@ -286,11 +374,19 @@ def finish(config, local, executable=None):
             raise ValueError('Entrada alterada: '+name)
     romfs = Path(config.get('romfs') or '')
     nacp = Path(config.get('nacp') or '')
-    if not config.get('romfs') or not (romfs/'Course').is_dir():
+    if not config.get('romfs') or not (filesystem_path(romfs)/'Course').is_dir():
         raise ValueError('RomFS do MK8 ausente ou incompleto')
     if not nacp.is_file() or nacp.read_bytes()[0x3060:0x3070].split(b'\0')[0] != b'4.0.1':
         raise ValueError('Esta build experimental exige NACP do MK8 4.0.1')
     output = job/('host-debug' if native['optimization'] == '-O0' else 'host-optimized')
+    # Old thin archives can still name objects at the portable tree's previous absolute location.
+    if native.get('object_files'):
+        from native import write_archive, DEFAULT_COMPILER
+        write_archive(DEFAULT_COMPILER, native['archive'], [obj['path'] for obj in native['object_files']])
+        native['sha256'] = sha(native['archive'])
+        atomic_json(local/'native.json', native)
+    from settings_layout import CONTROLLER_RELATIVE, prepare as prepare_settings_layout
+    settings_layout = prepare_settings_layout(romfs, output)
     exe = executable if executable is not None else build_host(source, output)
     dll = link_game(native['archive'], output, source, native['modules'])
     if not WINDOWS:
@@ -299,8 +395,6 @@ def finish(config, local, executable=None):
         subprocess.run([python_tool(), ROOT/'scripts/runtime-dlls.py', output], check=True)
     # Deep build hashes made Win32 stat silently omit 192 RomFS files at MAX_PATH.
     data = local/'game-data'/generated['identity'][:16]
-    if os.name == 'nt' and any(len(str(data/'extracted/romfs'/p.relative_to(romfs))) >= 260 for p in romfs.rglob('*') if p.is_file()):
-        raise ValueError('Caminho do RomFS excede MAX_PATH; use uma pasta local mais curta para os testes')
     print('Etapa: preparar os dados do jogo.', flush=True)
     for removed in [*unlink_links_on_the_way(data/'extracted/exefs', local), *unlink_links_on_the_way(data/'extracted/romfs', local)]:
         print(f'Link antigo removido (só o link): {removed}', flush=True)
@@ -311,14 +405,20 @@ def finish(config, local, executable=None):
     files['gamelib'] = files.pop(dll.name)
     files['gamelib-id'] = file_record(output/(GAME_NAME+'.id'))
     files['nacp'] = file_record(nacp)
+    files['settings-layout'] = file_record(settings_layout)
+    files['settings-common-layout'] = file_record(settings_layout.with_name('common.sarc'))
+    files['controller-layout'] = file_record(output/CONTROLLER_RELATIVE)
     for name in ('main', 'sdk', 'subsdk0', 'main.npdm'):
         files['npdm' if name == 'main.npdm' else name] = file_record(job/'inputs/exefs'/name)
     executable = file_record(exe)
     identity = hashlib.sha256(json.dumps({'generation': generated['identity'], 'files': files, 'exe': executable}, sort_keys=True).encode()).hexdigest()
     candidate = {'schema': 2, 'identity': identity, 'profile': 'mk8d-smm2-experimental', 'executable': executable,
                  'files': files, 'data_root': str(data), 'shader_root': str(local/'user/shaders'), 'gameplay_verified': False, 'dlc_supported': True,
+                 'split_screen_60fps_supported': guest_has_split_screen_hook(files),
                  'pack_supported': True,  # runtime/mk8/support/romfs_overlay.c: MK8_ROMFS_OVERLAY
-                 'cups_supported': True}  # toolchain/cup_relocation.py in the game library: MK8_CUPS_EXTRA
+                 'nextendo_supported': True, 'cups_supported': True, 'temporal_upscaling_supported': True,
+                 'romfs_long_paths_supported': True, 'nextendo_session_supported': True, 'live_settings_supported': True,
+                 'direct_lan_guest_supported': guest_has_direct_lan(files), 'bloom_supported': True, 'menu_themes_supported': True, 'menu_light_themes_supported': True}
     from import_dlc import attach
     attach(candidate, local)
     candidate['identity'] = hashlib.sha256(json.dumps({'generation': generated['identity'], 'files': files, 'exe': executable}, sort_keys=True).encode()).hexdigest()
@@ -339,9 +439,15 @@ def refresh_runtime(local):
     output = Path(candidate['executable']['path']).parent
     if Path(candidate['files']['gamelib']['path']).name != GAME_NAME:
         raise ValueError('Biblioteca de outra plataforma; execute Build.')
+    from settings_layout import CONTROLLER_RELATIVE, prepare as prepare_settings_layout
+    # Derived layouts are private build data; old candidates can predate this entry.
+    candidate['files'].pop('settings-layout', None)
+    candidate['files'].pop('settings-common-layout', None)
+    candidate['files'].pop('controller-layout', None)
     for file in candidate['files'].values():
         if sha(file['path']) != file['sha256']:
             raise ValueError('Biblioteca/dado alterado; use --finish: '+file['path'])
+    settings_layout = prepare_settings_layout(Path(candidate['data_root'])/'extracted/romfs', output)
     exe = build_host(source, output, game_library=None if WINDOWS else candidate["files"]["gamelib"]["path"])
     if WINDOWS:
         subprocess.run([python_tool(), ROOT/'scripts/runtime-dlls.py', output], check=True)
@@ -351,11 +457,24 @@ def refresh_runtime(local):
             if dll.resolve() != Path(candidate['files']['gamelib']['path']).resolve():
                 candidate['files'][dll.name] = file_record(dll)
     candidate['executable'] = {'path': str(exe), 'sha256': sha(exe), 'bytes': exe.stat().st_size}
+    candidate['files']['settings-layout'] = file_record(settings_layout)
+    candidate['files']['settings-common-layout'] = file_record(settings_layout.with_name('common.sarc'))
+    candidate['files']['controller-layout'] = file_record(output/CONTROLLER_RELATIVE)
     from import_dlc import attach
     attach(candidate, local)
     candidate['identity'] = hashlib.sha256(json.dumps({'generation': generated['identity'], 'files': candidate['files'], 'exe': candidate['executable']}, sort_keys=True).encode()).hexdigest()
     candidate['dlc_supported'] = True
     candidate['pack_supported'] = True
+    candidate['nextendo_supported'] = True
+    candidate['temporal_upscaling_supported'] = True
+    candidate['romfs_long_paths_supported'] = True
+    candidate['nextendo_session_supported'] = True
+    candidate['live_settings_supported'] = True
+    candidate['menu_themes_supported'] = True
+    candidate['menu_light_themes_supported'] = True
+    candidate['split_screen_60fps_supported'] = guest_has_split_screen_hook(candidate['files'])
+    candidate['bloom_supported'] = True
+    candidate['direct_lan_guest_supported'] = guest_has_direct_lan(candidate['files'])
     candidate['cups_supported'] = candidate.get('cups_supported', False)  # (the game library's, kept as it was)
     atomic_json(local/'candidate.json', candidate)
     print('Runtime atualizado; biblioteca do jogo preservada. Gameplay não qualificado.', flush=True)

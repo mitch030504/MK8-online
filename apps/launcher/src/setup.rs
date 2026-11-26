@@ -26,7 +26,7 @@ impl Step {
     }
 }
 
-fn local_python(root: &Path) -> PathBuf {
+pub(crate) fn local_python(root: &Path) -> PathBuf {
     root.join(if cfg!(windows) {
         "local/python/Scripts/python.exe"
     } else {
@@ -57,11 +57,88 @@ pub fn steps(root: &Path) -> Result<Vec<Step>, String> {
     ])
 }
 
+/// True when `python` runs and reports CPython 3.12 on a 64-bit build.
+#[cfg(target_os = "linux")]
+fn is_python312(python: &Path) -> bool {
+    Command::new(python)
+        .args([
+            "-I",
+            "-c",
+            "import sys,struct; print(sys.version_info[:2]==(3,12) and struct.calcsize('P')==8)",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|out| out.status.success() && out.stdout.starts_with(b"True"))
+}
+
+/// The tool environment pins CPython 3.12 wheels. Arch, CachyOS and Fedora ship a newer
+/// `python3` without `python3.12` (#112), so look for a 3.12 interpreter in the usual places
+/// before asking the player to install one.
+#[cfg(target_os = "linux")]
+fn find_python312() -> Result<PathBuf, String> {
+    if let Some(explicit) = std::env::var_os("MK8_PYTHON312").map(PathBuf::from) {
+        return if is_python312(&explicit) {
+            Ok(explicit)
+        } else {
+            Err(format!(
+                "MK8_PYTHON312 aponta para {}, que não é um Python 3.12 de 64 bits.",
+                explicit.display()
+            ))
+        };
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut candidates: Vec<PathBuf> = ["python3.12", "python3"].map(PathBuf::from).into();
+    candidates.extend(
+        [
+            "/usr/bin/python3.12",
+            "/usr/local/bin/python3.12",
+            "/opt/python3.12/bin/python3.12",
+        ]
+        .map(PathBuf::from),
+    );
+    if let Some(home) = &home {
+        candidates.push(home.join(".local/bin/python3.12"));
+        // pyenv, uv and asdf keep each version in its own folder.
+        for root in [
+            ".pyenv/versions",
+            ".local/share/uv/python",
+            ".asdf/installs/python",
+        ] {
+            if let Ok(entries) = std::fs::read_dir(home.join(root)) {
+                let mut found: Vec<_> = entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        let name = path.file_name().unwrap_or_default().to_string_lossy();
+                        name.starts_with("3.12") || name.starts_with("cpython-3.12")
+                    })
+                    .collect();
+                found.sort();
+                candidates.extend(
+                    found
+                        .into_iter()
+                        .rev()
+                        .map(|path| path.join("bin/python3.12")),
+                );
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|path| is_python312(path))
+        .ok_or_else(|| {
+            "Python 3.12 não encontrado. As ferramentas exigem exatamente o Python 3.12 (64 bits). \
+             Ubuntu/Debian: sudo apt install python3.12 python3.12-venv. Arch/CachyOS: instale \
+             python312 (AUR) ou use pyenv/uv. Depois reabra o launcher ou defina MK8_PYTHON312 \
+             com o caminho do executável."
+                .into()
+        })
+}
+
 #[cfg(target_os = "linux")]
 pub fn steps(root: &Path) -> Result<Vec<Step>, String> {
-    let python = std::env::var_os("MK8_PYTHON312")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("python3.12"));
+    let python = find_python312()?;
     Ok(vec![Step::new(
         "Ferramentas Linux",
         python,
@@ -90,11 +167,28 @@ impl State {
     }
 }
 
+/// The message of the last Python exception a failed step printed (`ValueError: DLC: ...`),
+/// so the launcher shows why a step failed and not only its exit code (issue #79).
+fn python_error(log: &str) -> Option<String> {
+    let line = log.lines().rev().find(|line| {
+        line.split_once(": ").is_some_and(|(kind, _)| {
+            !kind.is_empty()
+                && kind
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                && (kind.ends_with("Error") || kind.ends_with("Exception"))
+        })
+    })?;
+    let message = line.split_once(": ")?.1.trim();
+    (!message.is_empty()).then(|| message.chars().take(400).collect())
+}
+
 pub struct Setup {
     steps: Vec<Step>,
+    clean_after_setup: bool,
     current: usize,
     child: Option<Child>,
-    guards: Vec<File>,
+    guards: Vec<mk8_build_manager::ResourceGuard>,
     supervised: Option<(PathBuf, PathBuf)>,
     state: State,
     detail: String,
@@ -105,6 +199,7 @@ impl Default for Setup {
     fn default() -> Self {
         Self {
             steps: Vec::new(),
+            clean_after_setup: false,
             current: 0,
             child: None,
             guards: Vec::new(),
@@ -118,7 +213,9 @@ impl Default for Setup {
 
 impl Setup {
     pub fn start_guarded(&mut self, root: &Path, local: &Path) -> Result<(), String> {
-        self.start_steps_guarded(root, local, steps(root)?, &local.join("setup.log"))
+        self.start_steps_guarded(root, local, steps(root)?, &local.join("setup.log"))?;
+        self.clean_after_setup = true;
+        Ok(())
     }
 
     pub fn start_dlc(
@@ -215,6 +312,7 @@ impl Setup {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         File::create(log).map_err(|e| e.to_string())?;
+        self.clean_after_setup = false;
         self.steps = steps;
         self.log = log.to_path_buf();
         self.current = 0;
@@ -295,14 +393,40 @@ impl Setup {
                 let total = self.steps.len();
                 if !exit.success() {
                     let name = self.steps[self.current].name.clone();
+                    let reason = std::fs::read(&self.log)
+                        .ok()
+                        .and_then(|log| python_error(&String::from_utf8_lossy(&log)))
+                        .map(|reason| format!(" {reason}"))
+                        .unwrap_or_default();
                     self.fail(format!(
-                        "Etapa {}/{total} ({name}) falhou ({exit}). Consulte o log, corrija e tente de novo.",
+                        "Etapa {}/{total} ({name}) falhou ({exit}).{reason} Consulte o log, corrija e tente de novo.",
                         self.current + 1
                     ));
                     return true;
                 }
                 self.current += 1;
                 if self.current == total {
+                    if self.clean_after_setup {
+                        if let Some((root, local)) = &self.supervised {
+                            let result = mk8_build_manager::acquire_operation(root, local)
+                                .and_then(|_guards| {
+                                    if tool_checks(root).iter().any(|check| check["ok"] != true) {
+                                        return Err("A instalação das ferramentas não passou na verificação.".into());
+                                    }
+                                    #[cfg(windows)]
+                                    {
+                                        crate::managed::clean_old_tools(root).map_err(|e| e.to_string())?;
+                                    }
+                                    #[cfg(not(windows))]
+                                    let _ = root;
+                                    Ok(())
+                                });
+                            if let Err(e) = result {
+                                self.fail(format!("Limpeza das ferramentas anteriores: {e}"));
+                                return true;
+                            }
+                        }
+                    }
                     self.state = State::Done;
                     self.guards.clear();
                     self.detail =
@@ -393,7 +517,7 @@ fn python_check(root: &Path) -> Value {
 
 /// Reads `NAME = 'value'` from a setup script so the expected paths follow it.
 #[cfg(windows)]
-fn script_constant(text: &str, name: &str) -> Option<String> {
+pub(crate) fn script_constant(text: &str, name: &str) -> Option<String> {
     text.lines().find_map(|line| {
         let rest = line
             .trim()
@@ -670,6 +794,31 @@ mod tests {
         assert_eq!(status["steps"][2]["state"], "pending");
         assert!(status["detail"].as_str().unwrap().contains("2/3"));
         assert!(!fs::read_to_string(&log).unwrap().contains("tres"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_step_shows_the_python_error_message() {
+        let log = temp("python-error");
+        let mut setup = Setup::default();
+        let step = Step::new(
+            "dlc",
+            "cmd.exe",
+            &[
+                &"/C",
+                &"echo Traceback (most recent call last):& echo ValueError: DLC: ticket ausente ou incompatível.& exit 1",
+            ],
+        );
+        setup.start(vec![step], &log).unwrap();
+        wait(&mut setup);
+        let detail = setup.status()["detail"].as_str().unwrap().to_owned();
+        assert!(detail.contains("DLC: ticket ausente"), "{detail}");
+        assert!(!detail.contains("ValueError"), "{detail}");
+        assert_eq!(
+            python_error("x\nsubprocess.CalledProcessError: Command 'a' returned 1.\n").as_deref(),
+            Some("Command 'a' returned 1.")
+        );
+        assert_eq!(python_error("== Etapa 1/1: dlc ==\nexit: 1\n"), None);
     }
 
     #[test]

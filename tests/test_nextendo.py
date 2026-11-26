@@ -20,22 +20,48 @@ ROOT = Path(__file__).resolve().parents[1]
 @unittest.skipUnless(os.name == 'nt', 'Windows runtime required')
 class NextendoTests(unittest.TestCase):
     def run_flow(self, scenario, login_play=False):
-        candidate = json.loads((ROOT/'local/candidate.json').read_text())
-        exe = candidate['executable']['path']
+        exe = os.environ.get('MK8_NEXTENDO_TEST_EXE')
+        if not exe:
+            candidate = json.loads((ROOT/'local/candidate.json').read_text())
+            exe = candidate['executable']['path']
+        self.assertTrue(Path(exe).is_file(), 'Build the runtime or set MK8_NEXTENDO_TEST_EXE')
         calls = []
+        client_ids = []
         class Api(BaseHTTPRequestHandler):
             def log_message(self, *_):
                 pass
             def do_POST(self):
+                client_ids.append(self.headers.get('X-Nextendo-Client-Id'))
                 body = self.rfile.read(int(self.headers['Content-Length'])).decode()
                 calls.append((self.path, parse_qs(body)))
+                if scenario == 'legacy_token_path' and self.path == '/api/oauth/token':
+                    self.send_response(404); self.end_headers(); return
                 if scenario == 'server_error':
                     self.send_response(503); self.end_headers(); return
                 payload = json.dumps({'access_token':'synthetic-access', 'refresh_token':'synthetic-refresh', 'expires_in':3600}).encode()
                 self.send_response(200); self.send_header('Content-Length', str(len(payload))); self.end_headers(); self.wfile.write(payload)
             def do_GET(self):
+                client_ids.append(self.headers.get('X-Nextendo-Client-Id'))
                 calls.append((self.path, self.headers.get('Authorization')))
-                payload = json.dumps({'allow': True, 'nex_token': '' if scenario == 'no_nex' else 'synthetic-nex', 'pid':1800000001, 'username':'Fixture', 'expires_in':86400}).encode()
+                if self.path == '/api/friends?images=0':
+                    if scenario == 'social_denied':
+                        self.send_response(403); self.end_headers(); return
+                    entries = [{'pid':123, 'name':'Friend fixture', 'presence':{'status':2}}]
+                    if scenario == 'social_malformed': entries[0]['pid'] = -1
+                    payload = json.dumps({'friends':entries, 'requests':[], 'sent':[]}).encode()
+                elif self.path == '/api/my-lobby':
+                    own_id = 'x'*64 if scenario == 'social_own_id_long' else 12
+                    payload = json.dumps({'in_lobby':True,'lobby':{'id':own_id,'count':4,'max':12,'mode':'150 cc'}}).encode()
+                elif self.path == '/api/status/live':
+                    room = {'count':2,'max':12,'mode':'Worldwide race','kind':'mk8-world-race','state':'waiting'}
+                    game = {'titles':['0100152000022000'],'players':[{},{}],'lobbies':[room]}
+                    if scenario == 'social_success':
+                        game['lobbies'] += [dict(room,id=room_id) for room_id in ('x'*63,'x'*64,42)]
+                    if scenario == 'social_list_invalid': room['count']=99
+                    if scenario == 'social_list_missing': game['titles']=['another-title']
+                    payload = json.dumps({'games':[game]}).encode()
+                else:
+                    payload = json.dumps({'allow': True, 'nex_token': '' if scenario == 'no_nex' else 'synthetic-nex', 'pid':1800000001, 'username':'Fixture', 'expires_in':86400}).encode()
                 self.send_response(200); self.send_header('Content-Length', str(len(payload))); self.end_headers(); self.wfile.write(payload)
         server = ThreadingHTTPServer(('127.0.0.1', 0), Api)
         thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
@@ -44,6 +70,11 @@ class NextendoTests(unittest.TestCase):
                 folder = Path(tmp)
                 (folder/'save.dat').write_bytes(b'preserve-me')
                 env = dict(os.environ, MK8_NEXTENDO_TEST='1', RECOMP_NEXTENDO_API=f'http://127.0.0.1:{server.server_port}')
+                env['MK8_MENU_PROTOTYPE'] = '0'
+                env.pop('MK8_NEXTENDO_SOCIAL_TEST', None)
+                if scenario.startswith('social_'):
+                    del env['MK8_MENU_PROTOTYPE']
+                    env['MK8_NEXTENDO_SOCIAL_TEST'] = '1'
                 if scenario == 'disabled': env['MK8_NEXTENDO_TEST'] = '0'
                 proc = subprocess.Popen([exe, '--nextendo-login-play' if login_play else '--nextendo-auth-test'], cwd=folder, env=env,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
@@ -62,9 +93,10 @@ class NextendoTests(unittest.TestCase):
                     threading.Thread(target=read_url, daemon=True).start()
                     url = lines.get(timeout=15).strip()
                     params = parse_qs(urlsplit(url).query)
+                    self.assertEqual(urlsplit(url).path, '/api/oauth/authorize')
                     self.assertTrue(url, 'Native probe ended before producing an authorization URL')
                     self.assertEqual(params['client_id'], ['nxc_5QmpWFAhTHSd'])
-                    self.assertEqual(params['scope'], ['identity game.matchmaking'])
+                    self.assertEqual(params['scope'], ['identity game.matchmaking' + (' friends' if scenario.startswith('social_') else '')])
                     self.assertEqual(params['code_challenge_method'], ['S256'])
                     redirect = params['redirect_uri'][0]
                     self.assertEqual(urlsplit(redirect).hostname, '127.0.0.1')
@@ -75,11 +107,29 @@ class NextendoTests(unittest.TestCase):
                     except HTTPError as error:
                         self.assertEqual(error.code, 400)
                     output, errors = proc.communicate(timeout=25)
-                    self.assertEqual(proc.returncode, 0 if scenario == 'success' else 2 if scenario == 'no_nex' else 1, errors)
-                    if scenario == 'success': self.assertIn('BAAS adapter generated a token', output)
+                    succeeded = scenario in ('success', 'legacy_token_path', 'social_success')
+                    self.assertEqual(proc.returncode, 0 if succeeded else 2 if scenario == 'no_nex' or scenario.startswith('social_') else 1, errors)
+                    if scenario.startswith('social_'):
+                        if scenario == 'social_own_id_long': self.assertIn('lobby=0', output)
+                        else: self.assertIn('lobby=1 in_lobby=1 players=4/12', output)
+                        self.assertIn('friends=0 count=0' if scenario in ('social_denied','social_malformed') else 'friends=1 count=1', output)
+                        listings = 'valid=1 rooms=1 players=2 ids=0'
+                        if scenario == 'social_success': listings = 'valid=1 rooms=4 players=2 ids=2'
+                        if scenario in ('social_list_invalid','social_list_missing'): listings = 'valid=0 rooms=0 players=0 ids=0'
+                        self.assertIn('Listings: '+listings, output)
+                        self.assertIn(('/api/status/live','Bearer synthetic-access'), calls)
+                        self.assertIn(('/api/friends?images=0','Bearer synthetic-access'), calls)
+                        self.assertIn(('/api/my-lobby','Bearer synthetic-access'), calls)
+                    if succeeded: self.assertIn('BAAS adapter generated a token', output)
+                    if scenario == 'legacy_token_path':
+                        self.assertEqual(calls[1][0], '/oauth/token')
+                    if scenario == 'server_error':
+                        self.assertEqual(len(calls), 1, 'Do not retry failed requests on a different endpoint')
                     if scenario in ('wrong_state', 'denied'):
                         self.assertFalse(calls)
                     else:
+                        self.assertEqual(calls[0][0], '/api/oauth/token')
+                        self.assertTrue(all(value == 'nxc_5QmpWFAhTHSd' for value in client_ids))
                         form = calls[0][1]
                         verifier = form['code_verifier'][0]
                         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b'=').decode()
@@ -100,6 +150,14 @@ class NextendoTests(unittest.TestCase):
             server.shutdown(); server.server_close(); thread.join()
 
     def test_native_oauth_and_nex(self): self.run_flow('success')
+    def test_social_snapshot_and_signout(self): self.run_flow('social_success')
+    def test_social_permission_denied(self): self.run_flow('social_denied')
+    def test_social_malformed_account(self): self.run_flow('social_malformed')
+    def test_lobby_invalid_capacity(self): self.run_flow('social_list_invalid')
+    def test_current_room_rejects_overlong_id(self): self.run_flow('social_own_id_long')
+    def test_lobby_missing_game_not_empty_success(self): self.run_flow('social_list_missing')
+
+    def test_legacy_token_path_only_after_not_found(self): self.run_flow('legacy_token_path')
     def test_rejects_wrong_state(self): self.run_flow('wrong_state')
     def test_denied_consent(self): self.run_flow('denied')
     def test_nex_failure_is_not_success(self): self.run_flow('no_nex')
@@ -107,6 +165,77 @@ class NextendoTests(unittest.TestCase):
     def test_disabled_by_default(self): self.run_flow('disabled')
     def test_login_play_stops_on_denial(self): self.run_flow('denied', login_play=True)
     def test_login_play_stops_without_nex(self): self.run_flow('no_nex', login_play=True)
+
+    def test_session_reuse_rotation_expiry_and_transient_error_across_game_processes(self):
+        import mmap
+        import uuid
+        exe = os.environ.get('MK8_NEXTENDO_TEST_EXE') or json.loads((ROOT/'local/candidate.json').read_text())['executable']['path']
+        grants = []
+        fault = None
+
+        class Service(BaseHTTPRequestHandler):
+            def log_message(self, *_): pass
+            def reply(self, code, value):
+                payload = json.dumps(value).encode()
+                self.send_response(code)
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            def do_POST(self):
+                form = parse_qs(self.rfile.read(int(self.headers['Content-Length'])).decode())
+                kind = form['grant_type'][0]
+                grants.append((kind, form.get('refresh_token', [''])[0]))
+                if kind == 'refresh_token' and fault:
+                    return self.reply(fault, {'error': 'invalid_grant' if fault == 400 else 'temporarily_unavailable'})
+                self.reply(200, {'access_token':'test-access', 'refresh_token':f'test-refresh-{len(grants)}', 'expires_in':3600})
+            def do_GET(self):
+                # Stop before game initialization, after proving whether the refresh succeeded.
+                self.reply(503, {})
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Service)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        with tempfile.TemporaryDirectory() as tmp:
+            def launch(name, browser):
+                env = dict(os.environ, MK8_NEXTENDO_SESSION=name, MK8_NEXTENDO_TEST='1',
+                           RECOMP_NEXTENDO_API=f'http://127.0.0.1:{server.server_port}')
+                with subprocess.Popen([exe, '--nextendo-login-play'], cwd=tmp, env=env, text=True,
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as proc:
+                    try:
+                        if browser:
+                            urls = queue.Queue()
+                            def read_url():
+                                urls.put(next((line for line in proc.stdout if '/oauth/authorize?' in line), ''))
+                            threading.Thread(target=read_url, daemon=True).start()
+                            url = urls.get(timeout=15)
+                            self.assertIn('http://', url)
+                            params = parse_qs(urlsplit(url[url.index('http://'):].strip()).query)
+                            with urlopen(params['redirect_uri'][0]+'?'+urlencode({'state':params['state'][0], 'code':'fixture'}), timeout=10) as reply:
+                                self.assertEqual(reply.status, 200)
+                        output = proc.communicate(timeout=18)[0]
+                        self.assertNotIn('/oauth/authorize?', output)
+                        self.assertNotIn('test-refresh-', output)
+                        self.assertEqual(proc.returncode, 2, output)
+                    finally:
+                        if proc.poll() is None: proc.kill()
+            name = 'Local\\MK8-Nextendo-' + uuid.uuid4().hex
+            with mmap.mmap(-1, 600, tagname=name):
+                launch(name, True)
+                launch(name, False)
+                fault = 503
+                launch(name, False)
+                fault = None
+                launch(name, False)
+                fault = 400
+                launch(name, True)
+            self.assertEqual(grants, [('authorization_code',''), ('refresh_token','test-refresh-1'),
+                                      ('refresh_token','test-refresh-2'), ('refresh_token','test-refresh-2'),
+                                      ('refresh_token','test-refresh-4'), ('authorization_code','')])
+            with mmap.mmap(-1, 600, tagname=name):
+                launch(name, True)
+            self.assertEqual(list(Path(tmp).iterdir()), [])
 
     def test_per_host_tls_pin_separation(self):
         import sys
@@ -165,6 +294,15 @@ int main(void) {
     net_config_reload();
     assert(net_tls_pin_for_host("api-lp1.znc.srv.nintendo.net", znc_pin));
     assert(memcmp(game_pin, znc_pin, 32) == 0);
+    uint32_t race_ip, nat_ip, znc_ip;
+    _putenv("MK8_NEXTENDO_COMMUNITY=1");
+    _putenv("RECOMP_NEXTENDO_SERVER=192.0.2.1");
+    _putenv("RECOMP_NEXTENDO_NAT=192.0.2.2");
+    net_config_reload();
+    assert(net_resolve("g2b309e01-lp1.s.n.srv.nintendo.net", &race_ip));
+    assert(net_resolve("nncs2-lp1.n.n.srv.nintendo.net", &nat_ip));
+    assert(net_resolve("api-lp1.znc.srv.nintendo.net", &znc_ip));
+    assert(race_ip == nat_ip && race_ip != znc_ip);
     return 0;
 }
 ''', encoding='utf-8')

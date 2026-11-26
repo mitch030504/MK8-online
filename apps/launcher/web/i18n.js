@@ -4,8 +4,9 @@
 window.i18n = (() => {
   const languages = ["es", "en", "pt-BR"];
   const saved = document.querySelector('meta[name="mk8-language"]').content;
+  // Without a saved choice: the browser language for Portuguese and Spanish, English otherwise.
   const browser = navigator.language.toLowerCase();
-  let language = languages.includes(saved) ? saved : browser.startsWith("pt") ? "pt-BR" : browser.startsWith("en") ? "en" : "es";
+  let language = languages.includes(saved) ? saved : browser.startsWith("pt") ? "pt-BR" : browser.startsWith("es") ? "es" : "en";
   let catalog = {};
   let patterns = [];
   const catalogs = new Map();
@@ -93,7 +94,7 @@ window.i18n = (() => {
   }
   function render() {
     document.documentElement.lang = language;
-    picker.value = language;
+    if (picker) picker.value = language;
     const walker = document.createTreeWalker(document.documentElement, NodeFilter.SHOW_TEXT);
     while (walker.nextNode()) {
       const node = walker.currentNode;
@@ -107,14 +108,14 @@ window.i18n = (() => {
       if (element.textContent !== translated) element.textContent = translated;
     }
   }
-  picker.disabled = true;
+  if (picker) picker.disabled = true;
   const ready = load(language).then((loaded) => {
     use(language, loaded);
     register(document.documentElement);
     render();
-    picker.disabled = false;
+    if (picker) picker.disabled = false;
   });
-  picker.addEventListener("change", async () => {
+  picker?.addEventListener("change", async () => {
     const next = picker.value;
     picker.disabled = true;
     try {

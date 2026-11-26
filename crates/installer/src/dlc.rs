@@ -172,6 +172,16 @@ mod tests {
             dlc_supported: true,
             pack_supported: false,
             cups_supported: false,
+            nextendo_supported: false,
+            temporal_upscaling_supported: false,
+            romfs_long_paths_supported: false,
+            nextendo_session_supported: false,
+            live_settings_supported: false,
+            menu_themes_supported: false,
+            menu_light_themes_supported: false,
+            split_screen_60fps_supported: false,
+            bloom_supported: false,
+            direct_lan_guest_supported: false,
             files: BTreeMap::from([
                 (
                     "dlc-manifest".into(),

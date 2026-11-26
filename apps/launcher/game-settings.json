@@ -6,11 +6,14 @@
         {
           "key": "theme",
           "label": "Tema do menu",
-          "default": "Default",
+          "default": "Native",
           "kind": "select",
           "options": [
-            ["Default", "Padrão"],
-            ["NES", "NES"]
+            ["Native", "Nativo"],
+            ["Default", "Simples escuro"],
+            ["SimpleLight", "Simples claro"],
+            ["NES", "NES escuro"],
+            ["NESLight", "NES claro"]
           ]
         },
         {
@@ -19,9 +22,28 @@
           "default": "unlocked",
           "kind": "select",
           "options": [
-            ["unlocked", "Sem restrição"],
-            ["original", "Original 16:9"]
+            ["unlocked", "Esticar"],
+            ["original", "Original 16:9"],
+            ["ultrawide", "Ultrawide (experimental)"]
           ]
+        },
+        {
+          "key": "camera_distance",
+          "label": "Distância da câmera de pilotagem",
+          "default": "100",
+          "kind": "camera_distance"
+        },
+        {
+          "key": "split_screen_60fps",
+          "label": "60 FPS em tela dividida com 3 ou 4 jogadores",
+          "default": "0",
+          "kind": "bool"
+        },
+        {
+          "key": "bloom",
+          "label": "Bloom",
+          "default": "1",
+          "kind": "bool"
         },
         {
           "key": "fullscreen",
@@ -65,7 +87,10 @@
           "kind": "select",
           "options": [
             ["bilinear", "Bilinear"],
-            ["fsr1", "AMD FSR 1"]
+            ["fsr1", "AMD FSR 1"],
+            ["fsr3", "AMD FSR 3.1.6"],
+            ["fsr4", "AMD FSR 4.1.2"],
+            ["dlss", "NVIDIA DLSS Super Resolution"]
           ]
         },
         {
@@ -165,12 +190,6 @@
             ["xbox", "Xbox"],
             ["playstation", "PlayStation"]
           ]
-        },
-        {
-          "key": "pads_from_p2",
-          "label": "Controles começam no jogador 2",
-          "default": "0",
-          "kind": "bool"
         }
       ]
     },

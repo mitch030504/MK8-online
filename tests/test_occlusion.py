@@ -125,9 +125,10 @@ int main(void) {
     if (a[0][0] != 127 || a[1][0] != 6 || mk8_samples_total != 6 || query_reads!=3) return 5;
     query_ok=false; s2->seq=101; s2->n=2; s2->nrep=2;
     s2->rep_out[0]=a[2]; s2->rep_after[0]=1; s2->rep_out[1]=b[0]; s2->rep_after[1]=2;
-    uint64_t old_a=a[2][0],old_b=b[0][0];
-    if (!setjmp(failure)) { mk8_oq_resolve_done(101); return 9; }
-    assert(a[2][0]==old_a && b[0][0]==old_b && s2->nrep==2);
+    /* #127: results unavailable for a completed submission no longer end the game; each query counts as visible */
+    if (setjmp(failure)) return 9;
+    mk8_oq_resolve_done(101);
+    assert(a[2][0]==7 && b[0][0]==8 && mk8_samples_total==8 && s2->n==0 && s2->nrep==0);
     memset(mk8_oq,0,sizeof mk8_oq); query_ok=true; mk8_samples_total=0;
     uint64_t pair[4]={0},other[4]={0};
     CmdRec cmd={{1,(uintptr_t)pair,1}};
@@ -167,6 +168,16 @@ int main(void) {
         if (!setjmp(failure)) { condition(&cmd); return 10; }
         assert(st.render_off && mk8_oq[0].nrep==2);
         locked=0; // mock lock is still held by the fatal zero-sequence path
+    }
+    /* MK8_OCCL_STALE (experiment, default off): a pending report keeps the last resolved value; no flush, no wait. */
+    memset(mk8_oq,0,sizeof mk8_oq); mk8_samples_total=0; query_ok=true; timeout=false;
+    mk8_oq_stale=0; pair[0]=77; pair[2]=77; cmd.x[0]=0; cmd.x[1]=(uintptr_t)pair; cmd.x[2]=1;
+    reports(200,pair,other,0,0);
+    {   unsigned w0=waits, f0=flushes;
+        mk8_oq_stale=1;
+        condition(&cmd);
+        if (waits!=w0 || flushes!=f0 || pair[0]!=77 || pair[2]!=77 || st.render_off) return 11;
+        mk8_oq_stale=0;
     }
     return 0;
 }

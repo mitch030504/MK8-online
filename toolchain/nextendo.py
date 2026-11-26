@@ -1,4 +1,7 @@
-"""Bounded host-only Nextendo test adaptation, after upstream hash verification."""
+"""MK8 Nextendo adaptation applied to a verified runtime build copy."""
+
+from pathlib import Path
+import shutil
 
 def prepare(runtime):
     def edit(relative, old, new):
@@ -17,8 +20,29 @@ def prepare(runtime):
             raise ValueError('Nextendo region order changed: ' + relative)
         edit(relative, text[start:stop], replacement)
 
+    source = Path(__file__).resolve().parents[1] / 'runtime/mk8/net'
+    shutil.copyfile(source / 'social.h', runtime / 'net/mk8_social.h')
+    shutil.copyfile(source / 'nextendo_ca.h', runtime / 'net/nextendo_ca.h')
+    # Prepared headers participate in the host cache key, unlike .inc files.
+    shutil.copyfile(source / 'social.inc', runtime / 'net/mk8_social_impl.h')
+    edit('net/nextendo.c', '#define SCOPE "identity%20game.matchmaking"',
+         '#define SCOPE ((getenv("MK8_MENU_PROTOTYPE") && !strcmp(getenv("MK8_MENU_PROTOTYPE"), "0")) ? "identity%20game.matchmaking" : "identity%20game.matchmaking%20friends")')
+    edit('net/nextendo.c', 'void nx_test_reset(void) {',
+         '#include "mk8_social_impl.h"\n\nvoid nx_test_reset(void) {')
     edit('net/nextendo.c', '#define CLIENT_ID "nxc_R-JWtJ6JrrgY"',
          '#define CLIENT_ID "nxc_5QmpWFAhTHSd"\nextern bool mk8_nextendo_enabled(void);')
+    # Third-party integration contract: identify our registered public client on API requests.
+    edit('net/nextendo.c', '{"/oauth/token", "/api/oauth/token"}',
+         '{"/api/oauth/token", "/oauth/token"}')
+    edit('net/nextendo.c', '"%s/oauth/authorize", api_base()',
+         '"%s/api/oauth/authorize", api_base()')
+    edit('net/nextendo.c',
+         '"Content-Type: application/x-www-form-urlencoded\\r\\nAccept: application/json\\r\\n",',
+         '"Content-Type: application/x-www-form-urlencoded\\r\\nAccept: application/json\\r\\nX-Nextendo-Client-Id: " CLIENT_ID "\\r\\n",')
+    for token in ('S.access', 'tok'):
+        edit('net/nextendo.c',
+             '"Authorization: Bearer %s\\r\\nAccept: application/json\\r\\n", ' + token,
+             '"Authorization: Bearer %s\\r\\nAccept: application/json\\r\\nX-Nextendo-Client-Id: " CLIENT_ID "\\r\\n", ' + token)
     edit('net/nextendo.c', 'static void random_bytes(uint8_t *out, size_t n) {',
          'static bool random_bytes(uint8_t *out, size_t n) {')
     edit('net/nextendo.c', '    if (mbedtls_ctr_drbg_seed(&d, mbedtls_entropy_func, &e, (const unsigned char *)pers, sizeof pers) ||\n        mbedtls_ctr_drbg_random(&d, out, n)) {\n        for (size_t i = 0; i < n; i++) out[i] = (uint8_t)(rand() ^ (int)time(NULL) >> (i & 7));  // (no entropy: weak)\n    }',
@@ -30,6 +54,13 @@ def prepare(runtime):
         pthread_mutex_unlock(&lock);
         return false;
     }''')
+    # Say why no game token was asked for: a sign-in refresh that used the whole budget used to fail silently (#125).
+    edit('net/nextendo.c', '        left = (int)(end - now_ms());\n        if (access_ok && left > 0) {',
+         '        left = (int)(end - now_ms());\n'
+         '        if (!access_ok || left <= 0)\n'
+         '            LOG("[nextendo] game token: not requested (%s)\\n",\n'
+         '                access_ok ? "no time left after the sign-in refresh" : "the sign-in refresh failed");\n'
+         '        if (access_ok && left > 0) {')
     # Tokens and signing keys must not land in a save folder or support archive.
     edit('net/token.c', '    jwt_ok = jwt_key_read() || jwt_key_make();', '    jwt_ok = jwt_key_make();')
     edit('net/token.c', '    uint8_t d[8];\n    random_bytes(d, sizeof d);',
@@ -64,11 +95,20 @@ def prepare(runtime):
     edit('ui/online_rows.mm', 'extern "C" bool online_rows_available(void) { return true; }',
          'extern "C" bool mk8_nextendo_enabled(void);\nextern "C" bool online_rows_available(void) { return mk8_nextendo_enabled(); }')
     edit('ui/online_rows.mm', '    opt_section("Online");',
-         '    if (!mk8_nextendo_enabled()) return;\n    opt_section("Nextendo - experimental / session only");')
+         '    if (!mk8_nextendo_enabled()) return;\n    opt_heading("Nextendo");')
     edit('ui/online_rows.mm', '    if (e && *e == \'1\' && !nextendo_signed_in()) sign_in();',
          '    if (mk8_nextendo_enabled() && e && *e == \'1\' && !nextendo_signed_in()) sign_in();')
-    edit('ui/online_rows.mm', 'it "\n             "keeps a sign-in token for this device.',
-         'tokens "\n             "stay in memory until this game closes. MK8 matchmaking is not yet qualified.')
+    edit('ui/online_rows.mm', '''    static char ad[400];
+    snprintf(ad, sizeof ad, "%s%sSign in on nextendo.network in your browser. The game never sees your password; it "
+             "keeps a sign-in token for this device.", st.state == NX_ERROR ? st.message : "",
+             st.state == NX_ERROR && st.message[0] ? "\\n\\n" : "");''', '''    const auto language=mk8_menu_language();
+    const char *ad=mk8_menu_text(language,"Sign in through your browser","Faça login pelo navegador","Inicia sesión en el navegador");
+    if (st.state==NX_SIGNED_IN)
+        ad=mk8_menu_text(language,"Your Nextendo username","Seu nome de usuário no Nextendo","Tu nombre de usuario en Nextendo");
+    else if (st.state==NX_WAITING_BROWSER)
+        ad=mk8_menu_text(language,"Finish signing in through your browser","Conclua o login no navegador","Completa el acceso en el navegador");
+    else if (st.state==NX_ERROR && st.message[0]) ad=st.message;''')
+    edit('ui/online_rows.mm', '#include "option_rows.h"', '#include "option_rows.h"\n#include "menu_language.h"')
     edit('ui/online_rows.mm', '    if (st.state == NX_SIGNED_IN &&', '''    if (st.state == NX_WAITING_BROWSER && opt_action("Cancel sign-in", "Cancel", "Close the local login listener."))
         nextendo_sign_out();
     if (st.state == NX_SIGNED_IN &&''')
@@ -98,12 +138,31 @@ def prepare(runtime):
          'bool net_tls_pin_for_host(const char *host, uint8_t out[32]) {\n    init();\n    if (trust != NET_TRUST_PINNED) return false;\n'
          '    if (have_znc_pin && host && !strcmp(host, "api-lp1.znc.srv.nintendo.net")) {\n        memcpy(out, znc_pin, 32);\n        return true;\n    }\n'
          '    memcpy(out, pin, 32);\n    return true;\n}')
+    edit('services/ssl.c', '    bool alpn_asked;', '    bool alpn_asked, require_pin;\n    uint8_t expected_pin[32];')
     edit('services/ssl.c',
-         '        if (!net_tls_pin(pin)) { LOG("[ssl] %s: no certificate pin: refused\\n", c->sni); return false; }',
-         '        if (!net_tls_pin_for_host(c->sni, pin)) { LOG("[ssl] %s: no certificate pin: refused\\n", c->sni); return false; }')
+         '        uint8_t pin[32];\n        if (!net_tls_pin(pin)) {',
+         '        c->require_pin = true;\n        if (!net_tls_pin_for_host(c->sni, c->expected_pin)) {')
     edit('services/ssl.c',
-         '    if (net_tls_trust() == NET_TRUST_PINNED && (!net_tls_pin(pin) || !ssl_pin_check(mbedtls_ssl_get_peer_cert(&c->ssl), pin))) {',
-         '    if (net_tls_trust() == NET_TRUST_PINNED && (!net_tls_pin_for_host(c->sni, pin) || !ssl_pin_check(mbedtls_ssl_get_peer_cert(&c->ssl), pin))) {')
+         '    uint8_t pin[32];\n    if (net_tls_trust() == NET_TRUST_PINNED && (!net_tls_pin(pin) || !ssl_pin_check(mbedtls_ssl_get_peer_cert(&c->ssl), pin))) {',
+         '    if (c->require_pin && !ssl_pin_check(mbedtls_ssl_get_peer_cert(&c->ssl), c->expected_pin)) {')
+    edit('services/ssl.c', '#include "mbedtls/x509_crt.h"', '''#include "mbedtls/x509_crt.h"
+#include <stdbool.h>
+#include "../net/nextendo_ca.h"
+static bool nextendo_uses_ca(const char *sni) {
+    const char *community = getenv("MK8_NEXTENDO_COMMUNITY");
+    return community && !strcmp(community, "1") && strcmp(sni, "g2b309e01-lp1.s.n.srv.nintendo.net");
+}''')
+    edit('services/ssl.c', '    } else if (trust == NET_TRUST_PINNED) {', '''    } else if (trust == NET_TRUST_PINNED && nextendo_uses_ca(c->sni)) {
+        if (!c->sni[0] || is_ip(c->sni) ||
+            mbedtls_x509_crt_parse(&c->ca, nextendo_ca_pem, sizeof nextendo_ca_pem)) return false;
+        mbedtls_ssl_conf_ca_chain(&c->conf, &c->ca, NULL);
+        mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+    } else if (trust == NET_TRUST_PINNED) {''')
+    edit('services/ssl.c', '    mbedtls_ssl_set_hostname(&c->ssl, c->sni[0] && !is_ip(c->sni) ? c->sni : NULL);',
+         '    if (mbedtls_ssl_set_hostname(&c->ssl, c->sni[0] && !is_ip(c->sni) ? c->sni : NULL)) return false;')
+    edit('net/netcfg.c', '        add_rule(NEXTENDO_NAT_HOST,', '''        if (getenv("MK8_NEXTENDO_COMMUNITY") && !strcmp(getenv("MK8_NEXTENDO_COMMUNITY"), "1"))
+            add_rule("g2b309e01-lp1.s.n.srv.nintendo.net", nx_nat, "Nextendo MK8", true);
+        add_rule(NEXTENDO_NAT_HOST,''')
     region('net/netcfg.c', '#define OPTS(nextendo_available)', '    static NetBackendOption signed_out[]', '''#define OPTS(available) { \\
         {NET_BACKEND_OURS, "ours", "Offline", "MK8 Online Play is disabled. Launcher LAN rooms use a separate transport.", true}, \\
         {NET_BACKEND_LOCAL_NEX, "local-nex", "Local test server", "Developer NEX server on the local network.", false}, \\

@@ -16,9 +16,79 @@ ROOT=Path(__file__).resolve().parents[1]
 
 
 class LauncherTests(unittest.TestCase):
+    def test_nextendo_opt_in_button_and_backend_guard(self):
+        page = self.page()
+        try:
+            page.locator('[data-tab="play"]').click()
+            expect(page.locator('#play-nextendo')).to_be_visible()
+            expect(page.locator('#play-nextendo')).to_be_disabled()
+            token = page.locator('meta[name="mk8-token"]').get_attribute('content')
+            headers = {'X-MK8-Token': token}
+            refused = page.request.post(self.urls[0]+'/api/play', headers=headers,
+                                        data=json.dumps({'online':False, 'nextendo':True})).json()
+            self.assertFalse(refused['ok'])
+            self.assertRegex(refused['error'], 'Mii|Nextendo')
+            status = page.request.get(self.urls[0]+'/api/status', headers=headers).json()['data']
+            key = status['nextendo_game_key']
+            self.assertFalse(status['nextendo_trusted'])
+            invalid = page.request.post(self.urls[0]+'/api/nextendo/trust', headers=headers,
+                                        data=json.dumps({'key':'0'*64})).json()
+            self.assertFalse(invalid['ok'])
+            status.update(nextendo_supported=False, candidate=True, game_pid=None)
+            pending_status = []
+            hold_status = False
+            def send_status(route):
+                if hold_status:
+                    pending_status.append(route)
+                else:
+                    route.fulfill(json={'ok':True,'data':status})
+            page.route('**/api/status', send_status)
+            calls = []
+            page.route('**/api/mii/active', lambda route: route.fulfill(json={'ok':True,'data':'Piloto'}))
+            def play(route):
+                calls.append(route.request.post_data_json)
+                route.fulfill(json={'ok':True,'data':{'message':'Entre no Nextendo pelo navegador. No jogo, escolha Online Play. CTGP fica desativado nesta sessão.'}})
+            page.route('**/api/play', play)
+            expect(page.locator('#nextendo-rebuild')).to_be_visible()
+            status['nextendo_supported'] = True
+            expect(page.locator('#play-nextendo')).to_be_enabled()
+            # A background status poll may take longer than cancelling and reopening consent.
+            hold_status = True
+            page.locator('#play-nextendo').click()
+            expect(page.locator('#nextendo-key')).to_have_text(key)
+            page.locator('#nextendo-cancel').click()
+            self.assertFalse(calls)
+            page.locator('#play-nextendo').click()
+            expect(page.locator('#nextendo-consent')).to_be_visible()
+            with page.expect_response('**/api/play'):
+                page.locator('#nextendo-accept').click()
+            self.assertEqual(calls, [{'online':False, 'nextendo':True}])
+            hold_status = False
+            for request in pending_status:
+                send_status(request)
+            actual = page.request.get(self.urls[0]+'/api/status', headers=headers).json()['data']
+            self.assertTrue(actual['nextendo_trusted'])
+            status['nextendo_trusted'] = True
+            expect(page.locator('#notice')).to_contain_text('CTGP')
+            page.locator('#language').select_option('en')
+            expect(page.locator('#play-nextendo')).to_have_text('Play on Nextendo')
+            status['game_pid'] = 123
+            expect(page.locator('#play-nextendo')).to_be_disabled()
+            message = 'Nextendo refused online play for this account: link a Discord account at nextendo.network (account page) and try again.'
+            status.update(game_pid=None, game_exit='exit code: 2', nextendo_refusal_message=message)
+            expect(page.locator('#notice')).to_have_text(message)
+            expect(page.locator('#game-state')).to_have_text(message)
+            status.update(nextendo_refusal_message='Nextendo refused online access: maintenance', last_report='report-2.zip')
+            expect(page.locator('#notice')).to_have_text('Nextendo refused online access: maintenance')
+            status.update(nextendo_refusal_message=None, last_report='report-3.zip')
+            expect(page.locator('#notice')).to_have_text('The game exited with an error. A report was saved in Support.')
+        finally:
+            page.close()
+
     def test_dlc_mismatch_is_visible_before_game_launch_and_translated(self):
         page = self.page()
         try:
+            page.route('**/api/mii/active', lambda route: route.fulfill(json={'ok':True,'data':'Piloto'}))
             page.locator('[data-tab="session"]').click()
             expect(page.locator('#steam-dlc-hint')).to_contain_text('mesma DLC')
             page.route('**/api/steam/friends', lambda route: route.fulfill(json={'ok':True,'data':{
@@ -430,6 +500,92 @@ class LauncherTests(unittest.TestCase):
         finally:
             page.close()
 
+    @unittest.skipUnless(os.name != 'nt', 'The FSR page is Linux-only; Windows uses Video > Graphics (apps/launcher/web/app.js)')
+    def test_fsr_terms_precede_the_managed_install(self):
+        page = self.page(index=1)
+        page.evaluate("() => api('fsr/settings', {upscaling: '3.1.6', provider_lib: '', frame_generation: 'off', dxc: ''})")
+        page.locator('[data-tab="fsr"]').click()
+        expect(page.locator('#fsr-upscaling')).to_have_value('3.1.6')
+        expect(page.locator('#fsr-provider')).to_be_hidden()
+        expect(page.locator('#fsr-install')).to_be_hidden()
+        error = page.evaluate("() => api('fsr/install', {}).catch(error => error.message)")
+        self.assertIn('aceite a licença da AMD', error)
+
+        terms = page.locator('#fsr-license-load')
+        expect(terms).to_have_text('Ler e aceitar os termos da AMD')
+        # Synthetic consent response exercises the browser without accepting the vendor's terms.
+        license_info = {"verified": True, "present": True, "accepted": False, "bytes": 13, "sha256": "a" * 64}
+        def status_with_terms(route):
+            response = route.fetch()
+            status = response.json()
+            status['data']['license'] = license_info
+            route.fulfill(response=response, json=status)
+        def accept_fixture(route):
+            license_info['accepted'] = True
+            route.fulfill(json={"ok": True, "data": {"license": license_info}})
+        page.route('**/api/fsr', status_with_terms)
+        page.route('**/api/fsr/license', lambda route: route.fulfill(json={
+            'ok': True, 'data': {'text': 'Fixture terms', 'license': license_info}}))
+        page.route('**/api/fsr/accept', accept_fixture)
+        terms.click()
+        expect(page.locator('#fsr-license-text')).to_have_text('Fixture terms')
+        expect(page.locator('#fsr-license-save')).to_be_disabled()
+        page.locator('#fsr-license-accept').check()
+        expect(page.locator('#fsr-install')).to_be_hidden()
+        page.locator('#fsr-license-save').click()
+        expect(page.locator('#fsr-install')).to_be_visible()
+        expect(page.locator('#fsr-install')).to_be_enabled()
+        expect(page.locator('#fsr-provider')).to_be_hidden()
+
+    @unittest.skipUnless(os.name != 'nt', 'The FSR page is Linux-only; Windows uses Video > Graphics (apps/launcher/web/app.js)')
+    def test_fsr_picker_save_survives_an_overlapping_status_refresh(self):
+        page = self.page()
+        page.evaluate("() => api('fsr/settings', {upscaling: '3.1.6', provider_lib: '', frame_generation: 'off', dxc: ''})")
+        def show_picker(route):
+            response = route.fetch()
+            body = response.json()
+            body['data']['native_dialogs'] = True
+            route.fulfill(response=response, json=body)
+        page.route('**/api/status', show_picker)
+        page.evaluate('() => refresh()')
+        page.locator('[data-tab="fsr"]').click()
+        provider = page.locator('#fsr-provider')
+        picker = page.locator('[data-browse="fsr-provider"]')
+        expect(provider).to_be_hidden()
+        page.locator('#fsr-advanced summary').click()
+        expect(picker).to_be_visible()
+        expect(provider).to_be_enabled()
+
+        stale = []
+
+        def hold_status(route):
+            if stale:
+                route.continue_()
+            else:
+                stale.append((route, route.fetch()))
+
+        path = str(Path(self.temporary.name) / 'custom provider.so')
+        page.route('**/api/fsr', hold_status)
+        # Headless launchers have no native dialog. The settings and status requests use the real API.
+        page.route('**/api/browse', lambda route: route.fulfill(json={'ok': True, 'data': {'path': path}}))
+        page.evaluate('() => { void window.mk8Fsr.load(); }')
+        deadline = time.monotonic() + 5
+        while not stale and time.monotonic() < deadline:
+            page.wait_for_timeout(50)
+        self.assertTrue(stale, 'the pre-save FSR status request did not start')
+        with page.expect_response('**/api/fsr/settings') as saved:
+            picker.click()
+        self.assertEqual(saved.value.json()['data']['settings']['provider_lib'], path)
+        expect(provider).to_be_disabled()
+        expect(page.locator('#notice')).not_to_have_attribute('data-message', 'Provedor FSR salvo.', timeout=500)
+        route, response = stale[0]
+        route.fulfill(response=response)
+        expect(picker).to_be_enabled()
+        expect(provider).to_have_value(path, timeout=1500)
+        expect(page.locator('#notice')).to_have_attribute('data-message', 'Provedor FSR salvo.')
+        settings = json.loads((Path(self.temporary.name) / '0/launcher-settings.json').read_text('utf-8'))
+        self.assertEqual(settings['fsr']['provider_lib'], path)
+
     def test_settings_save_failure_unlocks_form_and_keeps_edits_for_retry(self):
         folder = Path(self.temporary.name) / "0/user-no-mii"
         folder.mkdir(exist_ok=True)
@@ -473,7 +629,8 @@ class LauncherTests(unittest.TestCase):
         folder = Path(self.temporary.name) / "0/user-no-mii"
         folder.mkdir(exist_ok=True)
         ini = folder / "mk8d.ini"
-        ini.write_text("# teste\nvolume = 0.50\nunknown_future = preserve\n", encoding="utf-8")
+        legacy = b"pads_from_p2 = 1\r\njoycon_mode = horizontal\r\n"
+        ini.write_bytes(b"# teste\r\nvolume = 0.50\r\nunknown_future = preserve\r\n" + legacy)
         page = self.page()
         try:
             page.locator('[data-tab="settings"]').click()
@@ -485,12 +642,14 @@ class LauncherTests(unittest.TestCase):
             page.locator("#config-sub-image").click()
             page.locator("#settings select[data-key=resolution]").select_option("75%")
             page.locator("#config-sub-controls").click()
+            expect(page.locator("[data-key=pads_from_p2], [data-key=joycon_mode]")).to_have_count(0)
             page.get_by_text("Mapeamento do teclado", exact=True).click()
             page.locator("#settings select[data-key=bind_key_a]").select_option("J")
             expect(page.locator("#settings select[data-key=bind_key_b]")).to_have_value("K")
             page.locator("#settings select[data-key=bind_key_a]").select_option("Space")
             page.locator("#settings-save").click()
             expect(page.locator("#notice")).to_contain_text("Configurações salvas.")
+            self.assertIn(legacy, ini.read_bytes())
             self.assertIn("unknown_future = preserve", ini.read_text())
             self.assertIn("bind_key_a = Space", ini.read_text())
             page.reload()
@@ -532,8 +691,8 @@ class LauncherTests(unittest.TestCase):
         expect(page.locator("#mp-mii-text")).to_have_text("Crie seu Mii para abrir ou entrar em salas.")
         refused = api("steam/host", {})
         self.assertFalse(refused["ok"])
-        self.assertIn("Crie seu Mii", refused["error"])
-        self.assertIn("Crie seu Mii", api("steam/join", {"lobby": "123"})["error"])
+        self.assertIn("Mii", refused["error"])
+        self.assertIn("Mii", api("steam/join", {"lobby": "123"})["error"])
         self.assertFalse(api("steam/join", {"lobby": "12a"})["ok"])
         page.get_by_role("button", name="Criar Mii agora", exact=True).click()
         expect(page.locator("#miis")).to_be_visible()
@@ -787,7 +946,7 @@ class LauncherTests(unittest.TestCase):
         real=page.request.get(self.urls[0]+'/api/status',headers={'X-MK8-Token':token}).json()['data']
         started=int(time.time()*1000)-125000
         def status(route):
-            data=dict(real)
+            data=dict(real, tools_ready=True)
             data['build']={'state':'running','detail':'Preparando o jogo.','pid':1,'percent':37.5,
                            'phase':'Compilando para o seu PC','started_ms':started,'duration_s':None}
             route.fulfill(json={'ok':True,'data':data})
@@ -809,7 +968,7 @@ class LauncherTests(unittest.TestCase):
         expect(page.locator('#build-log')).to_be_visible()
         page.screenshot(path=str(ROOT/"local/screenshots/launcher-build.png"),full_page=True)
         def done(route):
-            data=dict(real);data['candidate']=True
+            data=dict(real, tools_ready=True);data['candidate']=True
             data['build']={'state':'candidate','detail':'ok','pid':None,'percent':100,'phase':'Concluído',
                            'started_ms':started,'duration_s':1218.5}
             route.fulfill(json={'ok':True,'data':data})
@@ -826,17 +985,31 @@ class LauncherTests(unittest.TestCase):
         token=page.locator('meta[name="mk8-token"]').get_attribute('content')
         real=page.request.get(self.urls[0]+'/api/status',headers={'X-MK8-Token':token}).json()['data']
         self.assertFalse(real['candidate_stale'])  # (no game in this data folder)
+        tools_installed = False
+        files_ready = True
         def status(route):
             data=dict(real);data['candidate']=True;data['candidate_stale']=True;data['candidate_version']='0.1.2'
+            data.update(tools_ready=tools_installed, files=dict(real['files'], ready=files_ready, folder=False),
+                        setup=dict(real['setup'], state='done' if tools_installed else 'idle'))
             data['build']={'state':'idle','detail':'','pid':None,'percent':0,'phase':'','started_ms':None,'duration_s':None}
             route.fulfill(json={'ok':True,'data':data})
         page.route('**/api/status',status)
         page.reload()
+        expect(page.locator('#flow-step-0')).to_have_attribute('aria-current', 'step')
+        expect(page.locator('#flow-step-2')).to_be_disabled()
+        tools_installed = True
+        expect(page.locator('#flow-step-2')).to_have_attribute('aria-current', 'step')
         expect(page.locator('#build-stale')).to_be_visible()
         expect(page.locator('#build-stale')).to_contain_text('versão 0.1.2')
         expect(page.get_by_role('button',name='Atualizar a build',exact=True)).to_be_visible()
         expect(page.locator('#prepare-state')).to_have_text('Atualizar')
         expect(page.locator('#build-done')).to_be_hidden()
+        tools_installed = files_ready = False
+        page.reload()
+        expect(page.locator('#flow-step-0')).to_have_attribute('aria-current', 'step')
+        tools_installed = True
+        expect(page.locator('#flow-step-1')).to_have_attribute('aria-current', 'step')
+        expect(page.locator('#flow-step-2')).to_be_disabled()
         self.assertFalse(errors);page.close()
 
     def test_mii_resource_stream_finishes_before_wasm_request(self):

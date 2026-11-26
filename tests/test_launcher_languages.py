@@ -1,5 +1,6 @@
 """Language switching against the real launcher; installer UI uses isolated API fixtures."""
 import json
+import re
 import os
 from pathlib import Path
 import subprocess
@@ -50,7 +51,9 @@ class LanguageTests(unittest.TestCase):
             errors = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             try:
-                page.goto(url)
+                with page.expect_request(lambda req: req.url.endswith("/api/status")) as initial_status:
+                    page.goto(url)
+                self.assertEqual(initial_status.value.headers["x-mk8-language"], "en")
                 expect(page.get_by_role("heading", name="Installation", exact=True)).to_be_visible()
                 token = page.locator('meta[name="mk8-token"]').get_attribute("content")
                 saved = page.request.post(url + "/api/username", headers={"X-MK8-Token": token}, data=json.dumps({"name": "Instalar"}))
@@ -62,7 +65,9 @@ class LanguageTests(unittest.TestCase):
                 expect(page.locator("html")).to_have_attribute("lang", "pt-BR")
                 expect(page.locator("#mp-mii-text")).to_have_text("Crie seu Mii para abrir ou entrar em salas.")
                 expect(page.locator("#friend-filter")).to_have_value("literal-private-value")
-                page.get_by_label("Idioma", exact=True).select_option("es")
+                with page.expect_request(lambda req: req.url.endswith("/api/status") and
+                                          req.headers.get("x-mk8-language") == "es"):
+                    page.get_by_label("Idioma", exact=True).select_option("es")
                 expect(page.locator("html")).to_have_attribute("lang", "es")
                 expect(page.locator("#mp-mii-text")).to_have_text("Crea tu Mii para abrir salas o unirte a ellas.")
                 expect(page.get_by_role("button", name="Crear sala", exact=True)).to_be_visible()
@@ -239,8 +244,45 @@ class LanguageTests(unittest.TestCase):
         expect(rebuild).to_have_text("Start build")
         self.assertEqual(errors, [])
 
-    def test_installer_defaults_to_spanish_for_other_locales(self):
-        page = self.browser.new_page(locale="es-MX", viewport={"width": 880, "height": 620})
+    def test_uninstaller_uses_saved_language_and_requires_full_removal_confirmation(self):
+        page = self.browser.new_page()
+        self.addCleanup(page.close)
+        submissions = []
+
+        def route(request):
+            path = request.request.url.removeprefix("http://mk8.test/")
+            if path == "api/state":
+                request.fulfill(json={"ok": True, "data": {"version": "test", "data": "D:/Games/MK8"}})
+            elif path == "api/uninstall":
+                submissions.append(request.request.post_data_json)
+                request.fulfill(json={"ok": True, "data": {}})
+            elif not path:
+                html = (WEB / "uninstall.html").read_text(encoding="utf-8")
+                request.fulfill(body=html.replace("__LANGUAGE__", "en"), content_type="text/html; charset=utf-8")
+            else:
+                request.fulfill(path=WEB / path)
+
+        page.route("http://mk8.test/**", route)
+        for purge in (False, True):
+            page.goto("http://mk8.test/")
+            expect(page.locator("html")).to_have_attribute("lang", "en")
+            expect(page.locator("[value=keep]")).to_be_checked()
+            if purge:
+                page.locator("[value=all]").check()
+                expect(page.locator("#remove")).to_be_disabled()
+                page.locator("#confirm").check()
+            page.locator("#remove").click()
+            expect(page.locator("#done")).to_be_visible()
+            self.assertEqual(submissions[-1], {"purge": purge, "confirmed": purge})
+
+    def test_installer_follows_spanish_locale_and_defaults_to_english(self):
+        for locale, language, heading in (("es-MX", "es", "Bienvenido a MK8-online"),
+                                          ("de-DE", "en", "Welcome to MK8-online")):
+            with self.subTest(locale=locale):
+                self.installer_language(locale, language, heading)
+
+    def installer_language(self, locale, language, heading):
+        page = self.browser.new_page(locale=locale, viewport={"width": 880, "height": 620})
 
         def route(request):
             path = request.request.url.split("mk8.test", 1)[1]
@@ -254,9 +296,40 @@ class LanguageTests(unittest.TestCase):
         try:
             page.route("http://mk8.test/**", route)
             page.goto("http://mk8.test/")
-            expect(page.get_by_role("heading", name="Bienvenido a MK8-online")).to_be_visible()
-            expect(page.locator("html")).to_have_attribute("lang", "es")
-            expect(page.locator("#language")).to_have_value("es")
+            expect(page.get_by_role("heading", name=heading)).to_be_visible()
+            expect(page.locator("html")).to_have_attribute("lang", language)
+            expect(page.locator("#language")).to_have_value(language)
+        finally:
+            page.close()
+
+    def test_installer_refuses_data_folder_without_hard_links(self):
+        page = self.browser.new_page(locale="en-US", viewport={"width": 880, "height": 620})
+
+        def route(request):
+            path = request.request.url.split("mk8.test", 1)[1]
+            if path.startswith("/api/"):
+                if path == "/api/state":
+                    data = {"version": "0.4.0", "app": "C:\\Apps\\MK8-online", "data": "D:\\Games\\MK8-online", "desktop": True, "update": False, "needed_gib": 30}
+                elif path == "/api/space":
+                    data = {"free_gib": 400.0, "hard_disk": False, "file_system": "exFAT", "hard_links": False}
+                else:
+                    data = {}
+                request.fulfill(json={"ok": True, "data": data})
+                return
+            file = WEB / ("setup.html" if path == "/" else path[1:])
+            mime = {".html": "text/html", ".js": "text/javascript", ".json": "application/json", ".css": "text/css"}[file.suffix]
+            request.fulfill(body=file.read_text(encoding="utf-8").replace("__TOKEN__", "test").replace("__LANGUAGE__", ""), content_type=mime + "; charset=utf-8")
+
+        try:
+            page.route("http://mk8.test/**", route)
+            page.goto("http://mk8.test/")
+            page.get_by_role("button", name="Get started").click()
+            page.locator("#data").fill("G:\\Jeux\\MK8-online")
+            expect(page.locator("#space")).to_have_text(
+                "The drive of the data folder uses exFAT, which does not support hard links. Game preparation needs an NTFS drive: choose another folder or convert the drive to NTFS.")
+            expect(page.locator("#space")).to_have_class(re.compile(r"\bbad\b"))
+            page.get_by_label("Language", exact=True).select_option("es")
+            expect(page.locator("#space")).to_contain_text("unidad exFAT, que no admite enlaces físicos")
         finally:
             page.close()
 
@@ -318,6 +391,63 @@ class LanguageTests(unittest.TestCase):
             self.assertEqual(errors, [])
         finally:
             page.close()
+
+
+    def test_installer_finishes_once_and_can_retry_opening(self):
+        for launch in (True, False):
+            with self.subTest(launch=launch):
+                page = self.browser.new_page(locale="en-US")
+                page.clock.install()
+                progress = []
+                finishes = []
+
+                def route(request):
+                    path = request.request.url.removeprefix("http://mk8.test")
+                    if path == "/api/progress":
+                        progress.append(request)
+                        return
+                    if path == "/api/finish":
+                        finishes.append(request.request.post_data_json["launch"])
+                        if launch and len(finishes) == 1:
+                            request.fulfill(status=400, json={"ok": False, "error": "Initialization failed"})
+                            return
+                    if path.startswith("/api/"):
+                        request.fulfill(json={"ok": True, "data": {
+                            "version": "0.3.0", "app": r"C:\Apps\MK8-online", "data": r"D:\Games\MK8-online",
+                            "desktop": False, "update": False, "needed_gib": 30, "free_gib": 40,
+                        }})
+                        return
+                    file = WEB / ("setup.html" if path == "/" else path[1:])
+                    request.fulfill(path=file)
+
+                try:
+                    page.route("http://mk8.test/**", route)
+                    page.goto("http://mk8.test/")
+                    page.locator("#go-paths").click()
+                    expect(page.locator("#data")).to_have_value(r"D:\Games\MK8-online")
+                    page.locator("#launch").set_checked(launch)
+                    page.locator("#install").click()
+                    expect(page.locator("#progress")).to_be_visible()
+                    with page.expect_request("**/api/progress"):
+                        page.clock.run_for(250)
+                    page.clock.run_for(1000)
+                    self.assertEqual(len(progress), 1)
+                    progress[0].fulfill(json={"ok": True, "data": {"percent": 100, "state": "done"}})
+                    expect(page.locator("#done")).to_be_visible()
+                    if launch:
+                        expect(page.get_by_role("alert")).to_have_text("Initialization failed")
+                        self.assertEqual(finishes, [True])
+                        with page.expect_response("**/api/finish"):
+                            page.locator("#open").click()
+                        self.assertEqual(finishes, [True, True])
+                    else:
+                        page.clock.run_for(1000)
+                        self.assertEqual(finishes, [])
+                        with page.expect_response("**/api/finish"):
+                            page.locator("#close").click()
+                        self.assertEqual(finishes, [False])
+                finally:
+                    page.close()
 
 
 if __name__ == "__main__":

@@ -52,6 +52,32 @@ pub struct Installation {
     /// The game library takes added cups (`MK8_CUPS_EXTRA`, toolchain/cup_relocation.py): CTGP's "added" layout.
     #[serde(default)]
     pub cups_supported: bool,
+    /// This host verifies community TLS by hostname and supports the default in-game hub.
+    #[serde(default)]
+    pub nextendo_supported: bool,
+    /// This runtime can apply the launcher-selected temporal upscaler during presentation.
+    #[serde(default)]
+    pub temporal_upscaling_supported: bool,
+    #[serde(default)]
+    pub romfs_long_paths_supported: bool,
+    #[serde(default)]
+    pub nextendo_session_supported: bool,
+    #[serde(default)]
+    pub live_settings_supported: bool,
+    /// The host loads all three Menu themes from the shared INI and mounts the wrench for each.
+    #[serde(default)]
+    pub menu_themes_supported: bool,
+    /// The host can save and render Simple Light and NES Light.
+    #[serde(default)]
+    pub menu_light_themes_supported: bool,
+    /// The prepared game imports the split-screen cadence hook provided by the host.
+    #[serde(default)]
+    pub split_screen_60fps_supported: bool,
+    /// The prepared runtime can enable or suppress the bloom contribution.
+    #[serde(default)]
+    pub bloom_supported: bool,
+    #[serde(default)]
+    pub direct_lan_guest_supported: bool,
 }
 
 pub fn hash_file(path: &Path) -> Result<FileIdentity> {

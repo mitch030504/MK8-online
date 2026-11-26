@@ -9,7 +9,7 @@ let busy = false;
 async function api(path, body) {
   const response = await fetch("/api/" + path, {
     method: body === undefined ? "GET" : "POST",
-    headers: { "X-MK8-Token": token, "Content-Type": "application/json" },
+    headers: { "X-MK8-Token": token, "X-MK8-Language": i18n.language, "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const value = await response.json();
@@ -32,19 +32,50 @@ function notice(text, error = false) {
   }
 }
 $("notice-close").onclick = () => notice("");
+const viewOnly = Symbol("viewOnly");
 async function action(fn) {
   if (busy) return;
   busy = true;
   try {
     const result = await fn();
     if (result?.message) notice(result.message);
-    await refresh();
+    if (result !== viewOnly) await refresh();
   } catch (error) {
     notice(error.message, true);
   } finally {
     busy = false;
   }
 }
+
+let pendingPilotPlay;
+function clearPilotPlay() {
+  pendingPilotPlay = null;
+  $("mii-play-prompt").hidden = true;
+}
+async function withPilot(tab, start) {
+  if (await api("mii/active")) return start();
+  pendingPilotPlay = { tab, start };
+  showTab("miis");
+  $("mii-play-prompt").hidden = false;
+  $("mii-name").focus();
+  return viewOnly;
+}
+$("mii-play-cancel").onclick = () => {
+  const tab = pendingPilotPlay?.tab;
+  clearPilotPlay();
+  if (tab) showTab(tab);
+};
+window.addEventListener("launchertabchange", event => {
+  if (event.detail !== "miis") clearPilotPlay();
+});
+window.addEventListener("miireadytoplay", () => {
+  if (!pendingPilotPlay) return;
+  const { tab, start } = pendingPilotPlay;
+  clearPilotPlay();
+  showTab(tab);
+  action(start);
+});
+const joinSteam = (lobby, players = 1) => withPilot("session", () => api("steam/join", { lobby, players }));
 function config() {
   return {
     ...savedConfig,
@@ -65,7 +96,7 @@ function showTab(name) {
     $(item.dataset.tab).hidden = !selected;
   });
   window.dispatchEvent(new CustomEvent('launchertabchange', {detail:name}));
-  if (name === "settings") return Promise.all([loadGameSettings(), loadFontSettings()])
+  if (name === "settings") return Promise.all([loadGameSettings(), loadFontSettings(), loadGraphics()])
     .catch((error) => notice(error.message, true));
 }
 document
@@ -77,11 +108,71 @@ document
   .querySelectorAll("[data-goto]")
   .forEach((el) => (el.onclick = async () => {
     await showTab(el.dataset.goto);
-    if (el.dataset.anchor) $(el.dataset.anchor)?.scrollIntoView({ block: "start" });
+    if (el.dataset.anchor) {
+      const target = $(el.dataset.anchor);
+      target?.scrollIntoView({ block: "center" });
+      if (target?.matches("select")) target.focus({ preventScroll: true });
+    }
   }));
 
 /* ---------- Instalação: três passos ---------- */
+let graphicsCaps, graphicsBusy = false, graphicsTimer = 0, graphicsRequest = 0;
+let graphicsTermsVendor = "", graphicsReadVendor = "", graphicsResult = "";
+const vendorModes = {fsr3: "amd", fsr4: "amd", dlss: "nvidia"};
+function graphicsReady(mode) {
+  const caps = graphicsCaps;
+  if (!vendorModes[mode]) return true;
+  if (!caps) return false;
+  if (mode === "dlss") return caps.rtx && caps.nvidia;
+  return caps.amd && (mode !== "fsr4" || caps.rdna4) && caps.versions.includes(mode === "fsr3" ? "3.1.6" : "4.1.2");
+}
+async function loadGraphics() {
+  clearTimeout(graphicsTimer);
+  const request = ++graphicsRequest;
+  const data = await api("graphics");
+  if (request !== graphicsRequest) return;
+  graphicsBusy = data.running;
+  if (data.caps) graphicsCaps = data.caps;
+  if (data.error) notice(data.error, true);
+  updateGraphics();
+  updateSettingsLock();
+  if (graphicsBusy) graphicsTimer = setTimeout(() => loadGraphics().catch(e => notice(e.message, true)), 1200);
+}
+function updateGraphics() {
+  const scaler = document.querySelector('[data-key="upscaler"]'), panel = $("graphics-components");
+  if (!panel || !scaler) return;
+  if (window.mk8Platform === "linux") {
+    for (const option of scaler.options) if (vendorModes[option.value]) option.hidden = option.disabled = true;
+    panel.hidden = true;
+    return;
+  }
+  const mode = scaler.value, vendor = vendorModes[mode], caps = graphicsCaps;
+  for (const option of scaler.options) {
+    if (!vendorModes[option.value]) continue;
+    option.disabled = !caps?.gpu || (option.value === "fsr4" && !caps.rdna4) || (option.value === "dlss" && !caps.rtx);
+  }
+  const unsupported = scaler.selectedOptions[0]?.disabled;
+  const missingVersion = vendor === "amd" && caps?.amd && !graphicsReady(mode);
+  const needed = !!vendor && !graphicsReady(mode) && !unsupported && !missingVersion;
+  $("graphics-install-row").hidden = !needed;
+  if (graphicsTermsVendor !== vendor) {
+    graphicsTermsVendor = vendor; graphicsReadVendor = "";
+    $("graphics-consent").checked = false; $("graphics-license-text").hidden = true;
+  }
+  const described = mode === "fsr4" && !caps?.rdna4 ? "FSR 4 requer uma GPU AMD RDNA 4 compatível." :
+    mode === "dlss" && !caps?.rtx ? "DLSS requer uma GPU RTX compatível." :
+    missingVersion ? "A biblioteca AMD não oferece esta versão." :
+    needed ? "Instale o componente opcional para usar esta ampliação." : "";
+  const info = [caps?.gpu, i18n.t(described)];
+  if (caps?.gpu && !caps.rdna4 && !caps.rtx && !described) info.push(i18n.t("FSR 4 requer RDNA 4. DLSS requer RTX."));
+  $("graphics-gpu").textContent = info.filter(Boolean).join(" · ");
+  $("graphics-consent").disabled = graphicsBusy || !vendor || graphicsReadVendor !== vendor;
+  $("graphics-install").disabled = graphicsBusy || !$("graphics-consent").checked || graphicsReadVendor !== vendor;
+  i18n.text($("graphics-install"), graphicsBusy ? "Instalando…" : "Instalar componente");
+  $("graphics-active").textContent = graphicsResult;
+}
 let settingsLoaded = false;
+let settingsRequest = 0;
 let settingsDirty = false;
 let settingsBlocked = false;
 let settingsSaving = false;
@@ -113,7 +204,9 @@ function updateSettingsLock() {
   $("font-fields").disabled = settingsBlocked || fontsSaving || !fontsLoaded;
   const locked = settingsBlocked || settingsSaving;
   $("settings-fields").disabled = locked || !settingsLoaded;
-  $("settings-save").disabled = locked || !settingsLoaded || !settingsDirty;
+  const mode = document.querySelector('[data-key="upscaler"]')?.value;
+  const pendingProvider = mode && mode !== settingsBaseline.upscaler && !graphicsReady(mode);
+  $("settings-save").disabled = locked || !settingsLoaded || !settingsDirty || pendingProvider;
   $("settings-reload").disabled = locked;
 }
 function markSettingsDirty() {
@@ -123,7 +216,9 @@ function markSettingsDirty() {
 }
 async function loadGameSettings(force = false) {
   if ((settingsDirty || settingsSaving) && !force) return;
+  const request = ++settingsRequest;
   const data = await api("settings");
+  if (request !== settingsRequest) return;
   if ((settingsDirty || settingsSaving) && !force) return;
   if (!settingsLoaded) {
     for (const group of data.groups) {
@@ -132,6 +227,20 @@ async function loadGameSettings(force = false) {
       const title = document.createElement(group.binding ? "summary" : "h2");
       i18n.text(title, group.title);
       card.append(title);
+      if (group.fields.some((field) => field.key === "split_screen_60fps")) {
+        const note = document.createElement("p");
+        note.id = "video-runtime-upgrade";
+        note.className = "hint";
+        i18n.text(note, "Atualize a build usada para jogar para ajustar os 60 FPS em tela dividida.");
+        card.append(note);
+      }
+      if (group.fields.some((field) => field.key === "bloom")) {
+        const note = document.createElement("p");
+        note.id = "bloom-runtime-upgrade";
+        note.className = "hint";
+        i18n.text(note, "Atualize o runtime do jogo para ajustar o bloom.");
+        card.append(note);
+      }
       if (group.binding) {
         const reset = document.createElement("button");
         reset.type = "button";
@@ -168,6 +277,10 @@ async function loadGameSettings(force = false) {
         } else if (field.kind === "bool") {
           input.type = "checkbox";
           label.className = "settings-check";
+        } else if (field.kind === "camera_distance") {
+          input.type = "number";
+          input.min = "75"; input.max = "150"; input.step = "1";
+          input.required = true;
         } else {
           input.type = "number";
           input.min = "0"; input.max = "200"; input.step = "5";
@@ -186,12 +299,65 @@ async function loadGameSettings(force = false) {
             }
           }
           input.dataset.previous = input.value;
-          updateSettingsDependencies();
+          updateGraphics();
           markSettingsDirty();
         };
         label.prepend(caption);
-        label.append(input);
-        grid.append(label);
+        if (field.kind === "camera_distance") {
+          const row = document.createElement("div");
+          const controls = document.createElement("div");
+          controls.className = "camera-distance-controls";
+          i18n.html(controls, '<button type="button" aria-label="Diminuir distância da câmera">◀</button><button type="button" aria-label="Aumentar distância da câmera">▶</button>');
+          const [decrease, increase] = controls.children;
+          const jump = (delta) => {
+            const current = Number.isFinite(input.valueAsNumber) ? input.valueAsNumber : Number(field.default);
+            input.value = Math.min(Number(input.max), Math.max(Number(input.min), Math.round(current) + delta));
+            input.dispatchEvent(new Event("input", {bubbles: true}));
+          };
+          decrease.onclick = () => jump(-10);
+          increase.onclick = () => jump(10);
+          input.onkeydown = (event) => {
+            if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+              event.preventDefault();
+              jump(event.key === "ArrowUp" ? 10 : -10);
+            }
+          };
+          input.id = "config-field-camera_distance";
+          label.htmlFor = input.id;
+          controls.insertBefore(input, increase);
+          row.append(label, controls);
+          grid.append(row);
+        } else {
+          label.append(input);
+          grid.append(label);
+        }
+        if (field.key === "upscaler") {
+          const panel = document.createElement("div");
+          panel.id = "graphics-components"; panel.className = "graphics-components";
+          i18n.html(panel, `<small id="graphics-gpu"></small><small id="graphics-active" role="status"></small>
+            <div id="graphics-install-row" hidden>
+              <button id="graphics-license" type="button" class="link">Ler a licença</button>
+              <pre id="graphics-license-text" hidden tabindex="0"></pre>
+              <label><input id="graphics-consent" type="checkbox" disabled> Aceito a licença do componente</label>
+              <button id="graphics-install" type="button" disabled>Instalar componente</button>
+            </div>`);
+          grid.append(panel);
+          panel.querySelector("#graphics-license").onclick = async () => {
+            const vendor = vendorModes[input.value];
+            try {
+              const result = await api("graphics/license", {vendor});
+              if (vendor !== vendorModes[input.value]) return;
+              $("graphics-license-text").textContent = result.text;
+              $("graphics-license-text").hidden = false;
+              graphicsReadVendor = vendor; updateGraphics();
+            } catch (e) { notice(e.message, true); }
+          };
+          panel.querySelector("#graphics-consent").onchange = updateGraphics;
+          panel.querySelector("#graphics-install").onclick = () => action(async () => {
+            await api("graphics/install", {vendor: vendorModes[input.value], accept_terms: $("graphics-consent").checked});
+            await loadGraphics();
+          });
+        }
       }
       card.append(grid);
       $("settings-groups").append(card);
@@ -199,7 +365,13 @@ async function loadGameSettings(force = false) {
     settingsLoaded = true;
   }
   settingsBaseline = data.values;
+  const splitUnsupported = data.split_screen_60fps_supported === false;
+  $("video-runtime-upgrade").hidden = !splitUnsupported;
+  const bloomUnsupported = data.bloom_supported === false;
+  $("bloom-runtime-upgrade").hidden = !bloomUnsupported;
   for (const input of $("settings-groups").querySelectorAll("[data-key]")) {
+    if (input.dataset.key === "split_screen_60fps") input.disabled = splitUnsupported;
+    else if (input.dataset.key === "bloom") input.disabled = bloomUnsupported;
     const value = data.values[input.dataset.key];
     if (input.type === "checkbox") input.checked = value !== "0";
     else {
@@ -213,14 +385,10 @@ async function loadGameSettings(force = false) {
     }
   }
   settingsDirty = false;
-  updateSettingsDependencies();
+  updateGraphics();
   updateSettingsLock();
   i18n.text($("settings-pending"), "");
-}
-function updateSettingsDependencies() {
-  const scaler = document.querySelector('[data-key="upscaler"]');
-  const resolution = document.querySelector('[data-key="resolution"]');
-  if (scaler && resolution) scaler.disabled = resolution.value === "match";
+  window.dispatchEvent(new Event("gamesettingsloaded"));
 }
 $("game-settings").onsubmit = (event) => {
   event.preventDefault();
@@ -228,7 +396,8 @@ $("game-settings").onsubmit = (event) => {
     const patch = {};
     for (const input of $("settings-groups").querySelectorAll("[data-key]")) {
       const value = input.type === "checkbox" ? input.checked ? "1" : "0"
-        : input.dataset.kind === "volume" ? String(Number(input.value) / 100) : input.value;
+        : input.dataset.kind === "volume" ? String(Number(input.value) / 100)
+        : input.type === "number" ? String(input.valueAsNumber) : input.value;
       const previous = settingsBaseline[input.dataset.key];
       if (input.dataset.kind === "volume" ? Number(value) !== Number(previous) : value !== previous)
         patch[input.dataset.key] = value;
@@ -336,6 +505,9 @@ document.querySelectorAll("[data-browse]").forEach((button) => {
       }
       if (input.id === "ctgp-source") return { message: "Pasta selecionada." };
       if (input.id === "prepare-dlc-package") return { message: "Arquivo selecionado." };
+      if (input.id === "fsr-provider" || input.id === "fsr-dxc") {
+        return await window.mk8Fsr.afterBrowse(input.id);
+      }
       await saveGameFileConfig();
       return { message: "Arquivo selecionado." };
     });
@@ -516,7 +688,7 @@ function renderInstall(status) {
   $("dlc-change").hidden = dlc.state !== "ready" || dlcReplace;
   $("dlc-change").disabled = busyNow;
   i18n.text($("dlc-import"), dlc.state === "ready" ? "Reinstalar DLC…"
-    : dlc.state === "invalid" ? "Reparar importação…" : "Importar DLC NSP…");
+    : dlc.state === "invalid" ? "Reparar importação…" : "Importar DLC NSP/NSZ…");
   $("dlc-files").hidden = dlc.state === "ready" && !dlcReplace;
   for (const id of ["dlc-package", "dlc-keys"]) $(id).disabled = busyNow;
   document.querySelectorAll("[data-browse]").forEach((button) => (button.disabled = busyNow));
@@ -618,7 +790,9 @@ function renderInstall(status) {
   const done = !stale && !dlcRunning && (build.state === "candidate" || (status.candidate && !["running", "failed", "cancelled"].includes(build.state)));
   $("build-stale").hidden = !stale;
   if (stale)
-    i18n.text($("build-stale"), dlcUpgrade ? "Atualize a build para usar DLC." : "O jogo deste computador foi preparado por " + (status.candidate_version ? "a versão " + status.candidate_version : "uma versão anterior") +
+    i18n.text($("build-stale"), dlcUpgrade ? "Atualize a build para usar DLC." :
+      status.candidate_version === status.version ? "Atualize a build do jogo para usar os recursos desta edição do launcher." :
+      "O jogo deste computador foi preparado por " + (status.candidate_version ? "a versão " + status.candidate_version : "uma versão anterior") +
       " do launcher. Atualize a build para aplicar as correções da versão " + status.version +
       ": o que já foi feito é reaproveitado e leva poucos minutos.");
   $("build-idle").hidden = buildRunning || done;
@@ -679,8 +853,8 @@ function renderInstall(status) {
   if (buildRunning) i18n.append($("build-summary"), " · " + percentText(build.percent || 0));
 
   // The step to act on is open; finished ones close unless the user opened them.
-  const current = buildRunning || build.state === "failed" || done || stale ? "step-build"
-    : toolsState !== "done" && !filesReady ? "step-tools"
+  const current = buildRunning ? "step-build" : toolsState !== "done" ? "step-tools"
+    : build.state === "failed" || done || stale ? "step-build"
       : !filesReady ? "step-files" : "step-build";
   const open = new Set([current, ...userOpened]);
   if (toolsState !== "done" && !filesReady) open.add("step-files"); // (files can be chosen while tools download)
@@ -712,19 +886,24 @@ function steamButton(text, fn, primary = false) {
   button.onclick = () => action(fn);
   return button;
 }
+function steamJoinButtons(lobby, manualLabel = "Entrar") {
+  if (!previousSession?.directJoin) return [steamButton(manualLabel, () => joinSteam(lobby), true)];
+  return [
+    steamButton("Entrar (1P)", () => joinSteam(lobby, 1), true),
+    steamButton("Entrar (2P)", () => joinSteam(lobby, 2)),
+  ];
+}
 function renderSteam() {
   const data = steamData;
   const hosting = !!data?.room && !!previousSession?.hosting;
   $("steam-invites").replaceChildren(...(data?.invites ?? []).map((invite) =>
     listItem(i18n.t("Convite de {0}").replace("{0}", invite.friend), [
-      steamButton("Aceitar", () => api("steam/join", { lobby: invite.lobby }), true),
+      ...steamJoinButtons(invite.lobby, "Aceitar"),
       steamButton("Recusar", () => api("steam/dismiss", { lobby: invite.lobby })),
     ])));
   const rooms = (data?.friends ?? []).filter((friend) => friend.room && friend.room !== data.room);
   $("steam-rooms").replaceChildren(...rooms.map((friend) =>
-    listItem(i18n.t("Sala de {0}").replace("{0}", friend.name), [
-      steamButton("Entrar", () => api("steam/join", { lobby: friend.room }), true),
-    ])));
+    listItem(i18n.t("Sala de {0}").replace("{0}", friend.name), steamJoinButtons(friend.room))));
   $("steam-empty").hidden = !!(data?.invites?.length || rooms.length);
   const filter = $("friend-filter").value.trim().toLowerCase();
   const friends = (data?.friends ?? []).filter((friend) => friend.name.toLowerCase().includes(filter));
@@ -761,8 +940,9 @@ async function loadSteam() {
   }
   renderSteam();
 }
-$("steam-host").onclick = () => action(() => api("steam/host", { automatic: true }));
-$("steam-host-manual").onclick = () => action(() => api("steam/host", { automatic: false }));
+const hostSteam = automatic => action(() => withPilot("session", () => api("steam/host", { automatic })));
+$("steam-host").onclick = () => hostSteam(true);
+$("steam-host-manual").onclick = () => hostSteam(false);
 i18n.text($("steam-navigation").options[0], "Entrar automaticamente no jogo");
 i18n.text($("steam-navigation").options[1], "Navegar manualmente no jogo");
 $("steam-navigation").onchange = () => action(() => api("steam/navigation", {
@@ -775,9 +955,29 @@ document.querySelector('[data-tab="session"]').addEventListener("click", () => l
 setInterval(() => loadSteam(), 5000);
 
 /* ---------- Jogar e suporte ---------- */
-$("play-solo").onclick = () => action(() => api("play", { online: false }));
-$("play-online").onclick = () => action(() => api("play", { online: true }));
-let lastReport = null;
+const playSolo = () => api("play", { online: false });
+$("play-solo").onclick = () => action(() => withPilot("play", playSolo));
+$("play-online").onclick = () => action(() => withPilot("play", () => api("play", { online: true })));
+const playNextendo = () => api("play", { online: false, nextendo: true });
+$("play-nextendo").onclick = () => action(() => withPilot("play", () => {
+  if ($("play-nextendo").dataset.trusted === "true") return playNextendo();
+  $("nextendo-consent").showModal();
+  return viewOnly;
+}));
+$("nextendo-cancel").onclick = () => $("nextendo-consent").close();
+$("nextendo-account-links").onclick = event => {
+  const link = event.target.closest("a");
+  if (!link || $("nextendo-account-links").dataset.native !== "true") return;
+  event.preventDefault();
+  action(() => api("nextendo/account", { register: link.pathname === "/register" }));
+};
+$("nextendo-accept").onclick = () => action(async () => {
+  const key = $("nextendo-key").textContent;
+  $("nextendo-consent").close();
+  await api("nextendo/trust", { key });
+  return playNextendo();
+});
+let lastReport = null, lastRefusal = null;
 let update = null;
 function renderUpdate(result) {
   update = result;
@@ -812,6 +1012,14 @@ $("open-data").onclick = () => action(() => api("open", { what: "data" }));
 
 async function refresh() {
   const status = await api("status");
+  // Windows installs the verified AMD/NVIDIA components (Graphics); Linux builds them on the FSR page.
+  window.mk8Platform = status.platform;
+  const fsrTab = document.querySelector('[data-tab="fsr"]');
+  if (fsrTab) fsrTab.hidden = status.platform !== "linux";
+  if (status.steam_join_after_mii && !busy) {
+    const lobby = await api("steam/claim-join", {});
+    if (lobby) await action(() => joinSteam(lobby));
+  }
   const dlcBusy = status.dlc_import?.state === "running" || status.ctgp_import?.state === "running";
   if (status.room_menu !== roomMenu) {
     roomMenu = status.room_menu;
@@ -823,8 +1031,11 @@ async function refresh() {
   $("open-reports").hidden = !status.windowed;
   $("open-data").hidden = !status.windowed;
   $("data-dir").textContent = status.data_dir;
+  const refusal = status.nextendo_refusal_message;
+  if (refusal && refusal !== lastRefusal && lastReport !== null) notice(refusal, true);
+  lastRefusal = refusal;
   if (status.last_report && status.last_report !== lastReport) {
-    if (lastReport !== null) notice("O jogo fechou com erro. Um relatório foi salvo em Suporte.", true);
+    if (lastReport !== null && !refusal) notice("O jogo fechou com erro. Um relatório foi salvo em Suporte.", true);
     lastReport = status.last_report;
     $("report-path").textContent = status.last_report;
   } else if (lastReport === null) lastReport = "";
@@ -837,14 +1048,14 @@ async function refresh() {
     }[status.build.state] || status.build.state);
   renderInstall(status);
   if (!$("dlc-files").hidden) await refreshDlcFiles();
-  if (!$("settings").hidden && !settingsDirty) await loadGameSettings();
+  if ((!$("settings").hidden || !$("play").hidden) && !settingsDirty) await loadGameSettings();
   i18n.text($("installation-state"), status.installed
     ? "Instalação local disponível; compatibilidade de gameplay em validação."
     : "Nenhuma instalação de jogo ativada.");
   i18n.text($("game-state"), status.game_pid
     ? "Processo do jogo em execução."
     : status.game_exit
-      ? "Processo encerrado: " + status.game_exit
+      ? refusal || "Processo encerrado: " + status.game_exit
       : status.candidate
         ? "Build experimental disponível para teste."
         : "Prepare o jogo para habilitar a execução.");
@@ -862,6 +1073,11 @@ async function refresh() {
   $("play-solo").disabled =
     !(status.installed || status.candidate) || !!status.game_pid || running || status.setup.state === "running" || miiBusy || status.dlc_import?.state === "running";
   $("play-online").disabled = $("play-solo").disabled || !status.session.connected;
+  $("play-nextendo").dataset.trusted = String(status.nextendo_trusted);
+  $("nextendo-account-links").dataset.native = String(status.windowed);
+  $("nextendo-key").textContent = status.nextendo_game_key;
+  $("nextendo-rebuild").hidden = !(status.candidate || status.installed) || status.nextendo_supported;
+  $("play-nextendo").disabled = $("play-solo").disabled || !status.nextendo_supported;
   const session = status.session;
   const active = session.hosting || session.slot !== null;
   for (const id of ["steam-host", "steam-host-manual"]) {
@@ -889,10 +1105,21 @@ async function refresh() {
   if (previousSession && session.hosting && guests > previousSession.guests) {
     notice("Um amigo entrou na sua sala.");
   }
-  if (previousSession && !previousSession.hosting !== !session.hosting) renderSteam();
-  previousSession = { connected: session.connected, guests, hosting: session.hosting };
+  const directJoin = !!session.direct_lan_guest_supported && session.steam_auto_join !== false;
+  const upgrade = $("steam-direct-upgrade");
+  upgrade.hidden = !(status.installed || status.candidate) || !!session.direct_lan_guest_supported;
+  if (!upgrade.hidden) i18n.text(upgrade, status.installed
+    ? "O launcher usa a instalação qualificada mesmo quando há uma candidata mais recente. Atualize a instalação qualificada para entrar diretamente ou abra LAN Play no jogo."
+    : "Atualize o jogo preparado para abrir a lista LAN diretamente. Até lá, navegue até LAN Play no jogo.");
+  const joinsChanged = previousSession?.directJoin !== directJoin || previousSession?.hosting !== session.hosting;
+  previousSession = { connected: session.connected, guests, hosting: session.hosting, directJoin };
+  if (joinsChanged) renderSteam();
   const gameLog = await api("game/log");
   $("game-log").textContent = gameLog.text || i18n.t("Nenhum teste iniciado.");
+  const applied = [...(gameLog.text || "").matchAll(/^\[graphics\] (fsr1|3\.1\.6|4\.1\.2|dlss|native) (\d+x\d+) -> (\d+x\d+)\s*$/gm)].at(-1);
+  const methods = {fsr1: "FSR 1", "3.1.6": "FSR 3.1.6", "4.1.2": "FSR 4.1.2", dlss: "DLSS SR", native: i18n.t("Imagem do jogo")};
+  graphicsResult = applied ? i18n.t(status.game_pid ? "Em uso" : "Última sessão") + " · " + methods[applied[1]] + " · " + applied[2] + " → " + applied[3] : "";
+  if ($("graphics-active")) $("graphics-active").textContent = graphicsResult;
   const log = await api("log");
   const buildLog = $("build-log");
   const atEnd = buildLog.scrollTop + buildLog.clientHeight >= buildLog.scrollHeight - 30;
@@ -926,8 +1153,12 @@ async function refresh() {
     }
     const status = await refresh();
     const linkedTab = location.hash.slice(1);
-    if (["install", "settings", "play", "miis", "session", "support"].includes(linkedTab)) showTab(linkedTab);
-    else if ((status.candidate || status.installed) && !status.candidate_stale) showTab("play");  // (stale: the update is on Install)
+    if (linkedTab === "create-mii-to-play") {
+      history.replaceState(null, "", "#play");
+      await withPilot("play", playSolo);
+    }
+    else if (["install", "settings", "play", "miis", "session", "support", "fsr"].includes(linkedTab)) showTab(linkedTab);
+    else if (!pendingPilotPlay && status.tools_ready && (status.candidate || status.installed) && !status.candidate_stale) showTab("play");
     i18n.text($("update-state"), "Versão instalada: " + status.version);
     if (status.updates.configured) api("update/check", {}).then(renderUpdate).catch(() => {});
     else i18n.append($("update-state"), ". Atualizações automáticas não configuradas nesta edição.");

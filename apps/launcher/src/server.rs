@@ -31,6 +31,7 @@ pub type DialogParent = Arc<OnceLock<tauri::WebviewWindow>>;
 struct PendingPlay {
     role: &'static str,
     automatic: bool,
+    two_player_guest: bool,
 }
 
 impl PendingPlay {
@@ -53,8 +54,12 @@ pub struct App {
     steam_room: Option<SteamRoom>,
     gateway: Option<Gateway>,
     game: Option<Child>,
+    nextendo_session: crate::nextendo_session::Session,
     game_exit: Option<String>,
+    nextendo_log: Option<fs::File>,
+    nextendo_refusal: Option<String>,
     username: String,
+    browser_language: String,
     prepare_after_setup: bool,
     prepare_dlc: Option<PathBuf>,
     prepare_dlc_running: bool,
@@ -71,11 +76,16 @@ pub struct App {
     resources_state: &'static str,
     resources_detail: String,
     mii_download: crate::mii_download::Download,
+    graphics: crate::graphics::Components,
+    /// The child running the terms-gated FSR SDK download/build.
+    fsr_job: Option<crate::fsr::install::Job>,
     /// Steam lobby invites received from friends (lobby, friend), until accepted or the room is gone.
     steam_invites: Vec<(u64, u64)>,
     /// After creating or entering a Steam room: open the game in it as soon as the transport connects.
     pending_play: Option<PendingPlay>,
     steam_auto_join: bool,
+    /// Invite opened in Steam before a first Mii exists; claimed once by the editor.
+    steam_join_after_mii: Option<String>,
     /// The last Steam failure that happened outside a request (an accepted invite that could not be joined).
     steam_error: Option<String>,
     /// Steam was used before on this PC: connect again at start, so invites reach the launcher.
@@ -108,12 +118,18 @@ fn dlc_keys(config: &Config, package: &str, keys: &str) -> Option<PathBuf> {
     detect_keys(&config)
 }
 
+fn is_dlc_package(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("nsp") || ext.eq_ignore_ascii_case("nsz"))
+}
+
 fn dlc_files(config: &Config, package: &str, keys: &str) -> Value {
     let selected = dlc_keys(config, package, keys);
     let package_path = Path::new(package);
     json!({
-        "package_ok": !package.is_empty() && package_path.is_file()
-            && package_path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("nsp")),
+        "package_ok": is_dlc_package(package_path),
         "keys_ok": selected.as_ref().is_some_and(|path| path.is_file()),
         "keys_detected": keys.is_empty(),
         "keys": selected.map(|path| path.to_string_lossy().into_owned()),
@@ -178,8 +194,12 @@ impl App {
             steam_room: None,
             gateway: None,
             game: None,
+            nextendo_session: Default::default(),
             game_exit: None,
+            nextendo_log: None,
+            nextendo_refusal: None,
             username,
+            browser_language: String::new(),
             prepare_after_setup: false,
             prepare_dlc: None,
             prepare_dlc_running: false,
@@ -195,9 +215,12 @@ impl App {
             resources_state: "idle",
             resources_detail: String::new(),
             mii_download: Default::default(),
+            graphics: Default::default(),
+            fsr_job: None,
             steam_invites: Vec::new(),
             pending_play: None,
             steam_auto_join,
+            steam_join_after_mii: None,
             steam_error: None,
             steam_retry: None,
         }
@@ -206,7 +229,7 @@ impl App {
     /// Rooms are entered as the player's Mii: its name is the name other players see.
     fn mii_name(&mut self) -> Result<String> {
         let profile = mk8_installer::mii::read(&self.local)?
-            .ok_or("Crie seu Mii em Perfil Mii antes de abrir ou entrar em uma sala.")?;
+            .ok_or("Crie um Mii em Perfil Mii para continuar.")?;
         let name = profile.appearance.name;
         if valid_username(&name) && name != self.username {
             save(&self.local.join("username.json"), &name)?;
@@ -268,6 +291,7 @@ impl App {
         self.pending_play = Some(PendingPlay {
             role: "host",
             automatic,
+            two_player_guest: false,
         });
         self.steam_error = None;
         let _ = fs::write(self.local.join("steam-enabled"), b"1");
@@ -280,10 +304,25 @@ impl App {
         )
     }
 
-    fn steam_join(&mut self, lobby: &str) -> Result<()> {
+    fn steam_join(&mut self, lobby: &str, two_player_guest: bool) -> Result<()> {
         self.check_room_preparation()?;
-        self.prepare_steam_join()?;
         self.mii_name()?;
+        let install = self.installation();
+        let qualified = install.is_some();
+        let direct = install
+            .or_else(|| self.candidate())
+            .is_some_and(|game| game.direct_lan_guest_supported);
+        let automatic = self.steam_auto_join && direct;
+        if two_player_guest && !automatic {
+            return Err(if direct {
+                "Ative a entrada automática para entrar diretamente com 2 jogadores neste PC."
+            } else if qualified {
+                "Para entrar diretamente com 2 jogadores, atualize a instalação qualificada e ative a entrada automática. A instalação qualificada tem prioridade sobre a candidata."
+            } else {
+                "Para abrir a lista LAN de 2 jogadores, atualize o jogo preparado e ative a entrada automática."
+            }.into());
+        }
+        self.prepare_steam_join()?;
         let identity = self.identity();
         let (room, gateway) = SteamRoom::join_live(
             &self.local,
@@ -298,7 +337,8 @@ impl App {
         self.gateway = Some(gateway);
         self.pending_play = Some(PendingPlay {
             role: "guest",
-            automatic: self.steam_auto_join,
+            automatic,
+            two_player_guest,
         });
         self.steam_error = None;
         let _ = fs::write(self.local.join("steam-enabled"), b"1");
@@ -358,10 +398,7 @@ impl App {
         for event in steam::take_events() {
             match event {
                 SteamEvent::Join { lobby } => {
-                    match self.steam_join(&lobby.to_string()) {
-                        Ok(()) => self.room_menu += 1,
-                        Err(error) => self.steam_error = Some(error),
-                    }
+                    self.auto_join_steam_lobby(&lobby.to_string());
                     if let Some(window) = self.window.as_ref().and_then(|parent| parent.get()) {
                         let _ = window.show();
                         let _ = window.unminimize();
@@ -381,7 +418,7 @@ impl App {
                 self.pending_play = None;
             } else if self.gateway.as_ref().is_some_and(|g| g.connected()) {
                 self.pending_play = None;
-                if let Err(error) = self.start_game(true, play.auto_lan()) {
+                if let Err(error) = self.start_game(true, Some(play), false) {
                     self.steam_error = Some(error);
                 }
             }
@@ -389,7 +426,29 @@ impl App {
     }
 
     /// Starts the game (in the connected room when `online`); `auto_lan` makes it enter the LAN room by itself.
-    fn start_game(&mut self, online: bool, auto_lan: Option<&str>) -> Result<u32> {
+    pub fn play_direct(&mut self) -> Result<()> {
+        self.start_game(false, None, false)?;
+        let mut child = self.game.take().ok_or("O jogo não iniciou")?;
+        let status = child.wait().map_err(|e| e.to_string())?;
+        let shown = self.finish_game(status);
+        if !status.success() {
+            return Err(format!(
+                "O jogo encerrou com erro: {shown}. Consulte game.log na pasta de dados."
+            ));
+        }
+        Ok(())
+    }
+
+    fn start_game(
+        &mut self,
+        online: bool,
+        play: Option<PendingPlay>,
+        nextendo: bool,
+    ) -> Result<u32> {
+        let pilot = self.mii_name()?;
+        if nextendo && (!mk8_installer::nextendo_trusted(&self.local) || online || play.is_some()) {
+            return Err("Nextendo indisponível nesta sessão.".into());
+        }
         self.dlc_import.poll();
         self.ctgp_import.poll();
         if self.imports_running() {
@@ -397,8 +456,12 @@ impl App {
         }
         self.poll_native();
         self.poll_resources();
+        self.poll_fsr();
         if self.native_job.is_some() || self.resources_job.is_some() {
             return Err("Aguarde a conversão Mii terminar.".into());
+        }
+        if self.fsr_job.is_some() {
+            return Err("Aguarde a instalação do FSR terminar.".into());
         }
         if self.game.is_some() {
             return Err("O jogo já está aberto.".into());
@@ -428,18 +491,37 @@ impl App {
             local: self.local.clone(),
             install,
             network: net,
-            username: self.username.clone(),
+            username: pilot,
             candidate,
-            auto_lan: auto_lan.map(str::to_owned),
+            browser_language: self.browser_language.clone(),
+            auto_lan: play.and_then(PendingPlay::auto_lan).map(str::to_owned),
+            two_player_guest: play.is_some_and(|p| p.two_player_guest),
+            nextendo,
+            nextendo_session: if nextendo {
+                self.nextendo_session.name()?
+            } else {
+                None
+            },
         })?;
         let pid = child.id();
         self.game_exit = None;
+        self.nextendo_refusal = None;
+        // Keep this session's log even if another launcher later rotates game.log.
+        self.nextendo_log = if nextendo {
+            fs::File::open(self.local.join("game.log")).ok()
+        } else {
+            None
+        };
         self.game = Some(child);
         Ok(pid)
     }
 
     pub fn auto_join_steam_lobby(&mut self, lobby_id: &str) {
-        match self.steam_join(lobby_id) {
+        if matches!(mk8_installer::mii::read(&self.local), Ok(None)) {
+            self.steam_join_after_mii = Some(lobby_id.to_owned());
+            return;
+        }
+        match self.steam_join(lobby_id, false) {
             Ok(()) => self.room_menu += 1,
             Err(error) => self.steam_error = Some(error),
         }
@@ -539,6 +621,35 @@ impl App {
         Ok(value)
     }
 
+    fn poll_fsr(&mut self) {
+        let Some(job) = self.fsr_job.as_mut() else {
+            return;
+        };
+        match job.poll() {
+            Ok(None) => (),
+            Ok(Some(exit)) => {
+                if !exit.success() {
+                    job.record_interruption(&format!(
+                        "A instalação do FSR terminou com erro ({exit}). Consulte o log."
+                    ));
+                }
+                self.fsr_job = None;
+            }
+            Err(error) => {
+                let _ = job.cancel();
+                job.record_interruption(&format!(
+                    "Não foi possível consultar a instalação do FSR: {error}"
+                ));
+                self.fsr_job = None;
+            }
+        }
+    }
+
+    fn fsr_page(&mut self) -> Result<Value> {
+        self.poll_fsr();
+        crate::fsr::page(&self.root, &self.local, self.fsr_job.is_some())
+    }
+
     fn store_config(&mut self, config: Config) -> Result<()> {
         if self.prepare_after_setup
             || self.build.poll().state == "running"
@@ -593,6 +704,10 @@ impl App {
     }
 
     fn start_build(&mut self) -> Result<()> {
+        self.tools = setup::tool_checks(&self.root);
+        if !self.tools.iter().all(|check| check["ok"] == true) {
+            return Err("Instale as ferramentas antes de iniciar a build.".into());
+        }
         if self.imports_running() {
             return Err("Aguarde a importação do DLC ou do CTGP.".into());
         }
@@ -605,18 +720,21 @@ impl App {
     }
 
     fn log_tail(&self, name: &str) -> Result<String> {
-        let mut text = String::new();
-        if let Ok(mut file) = fs::File::open(self.local.join(name)) {
-            let size = file.metadata().map_err(|e| e.to_string())?.len();
-            file.seek(SeekFrom::Start(size.saturating_sub(32000)))
-                .map_err(|e| e.to_string())?;
-            let mut bytes = Vec::new();
-            file.take(32000)
-                .read_to_end(&mut bytes)
-                .map_err(|e| e.to_string())?;
-            text = String::from_utf8_lossy(&bytes).into_owned();
+        match fs::File::open(self.local.join(name)) {
+            Ok(file) => Self::read_log_tail(file),
+            Err(_) => Ok(String::new()),
         }
-        Ok(text)
+    }
+
+    fn read_log_tail(mut file: fs::File) -> Result<String> {
+        let size = file.metadata().map_err(|e| e.to_string())?.len();
+        file.seek(SeekFrom::Start(size.saturating_sub(32000)))
+            .map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        file.take(32000)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     fn installation(&self) -> Option<Installation> {
@@ -628,6 +746,27 @@ impl App {
                     && install.gameplay_verified
             })
     }
+    fn menu_build(&self) -> crate::game_settings::MenuBuild {
+        self.installation()
+            .or_else(|| self.candidate())
+            .as_ref()
+            .map_or(crate::game_settings::MenuBuild::FiveThemes, |build| {
+                build.into()
+            })
+    }
+
+    fn split_screen_60fps_supported(&self) -> bool {
+        self.installation()
+            .or_else(|| self.candidate())
+            .is_none_or(|game| game.split_screen_60fps_supported)
+    }
+
+    fn bloom_supported(&self) -> bool {
+        self.installation()
+            .or_else(|| self.candidate())
+            .is_none_or(|game| game.bloom_supported)
+    }
+
     fn identity(&self) -> String {
         self.installation()
             .or_else(|| self.candidate())
@@ -652,22 +791,49 @@ impl App {
     }
     fn poll_game(&mut self) {
         if let Some(exit) = self.game.as_mut().and_then(|c| c.try_wait().ok().flatten()) {
-            self.game_exit = Some(exit.to_string());
             self.game = None;
-            if self.steam_room.is_some() {
-                self.clear_steam_session();
-            }
-            if !exit.success() {
-                // A crash leaves its report ready to send, before the next launch rotates the log.
-                let summary =
-                    json!({"game_exit": exit.to_string(), "build": self.build.poll().state});
-                let install = self.installation().or_else(|| self.candidate());
-                let runtime = install.as_ref().and_then(|i| i.executable.path.parent());
-                self.last_report = report::create(&self.local, runtime, "game-exit", summary)
-                    .ok()
-                    .map(|p| p.display().to_string());
-            }
+            self.finish_game(exit);
         }
+    }
+
+    fn finish_game(&mut self, exit: std::process::ExitStatus) -> String {
+        if self.steam_room.is_some() {
+            self.clear_steam_session();
+        }
+        let session_log = self.nextendo_log.take();
+        self.nextendo_refusal = None;
+        let mut shown = exit.to_string();
+        if !exit.success() {
+            let nextendo = session_log.is_some();
+            let log = match session_log {
+                Some(file) => Self::read_log_tail(file),
+                None => self.log_tail("game.log"),
+            }
+            .unwrap_or_default();
+            let language = crate::language::effective(&self.local);
+            let detail =
+                crate::game_session::exit_reason(&log, exit.code(), &language).or_else(|| {
+                    if !nextendo {
+                        return None;
+                    }
+                    let code = crate::game_session::nextendo_refusal_code(&log)?;
+                    if exit.code() == Some(2) {
+                        self.nextendo_refusal = Some(code.to_owned());
+                    }
+                    Some(crate::game_session::nextendo_message(code, &language))
+                });
+            if let Some(reason) = &detail {
+                shown = format!("{shown}. {reason}");
+            }
+            let summary = json!({"game_exit": exit.to_string(), "game_exit_detail": detail, "build": self.build.poll().state});
+            let install = self.installation().or_else(|| self.candidate());
+            let runtime = install.as_ref().and_then(|i| i.executable.path.parent());
+            self.last_report = report::create(&self.local, runtime, "game-exit", summary)
+                .ok()
+                .map(|p| p.display().to_string());
+        }
+        self.game_exit = Some(shown.clone());
+        shown
     }
 
     fn status(&mut self) -> Value {
@@ -728,9 +894,38 @@ impl App {
         let candidate_version = load::<Value>(&built_with)
             .ok()
             .and_then(|v| v["version"].as_str().map(str::to_owned));
-        let candidate_stale =
-            candidate_exists && candidate_version.as_deref() != Some(update::CURRENT);
         let install = self.installation();
+        let candidate = self.candidate();
+        let nextendo_supported = install
+            .as_ref()
+            .or(candidate.as_ref())
+            .is_some_and(|game| game.nextendo_supported);
+        let runtime_upgrade = candidate.as_ref().is_some_and(|game| {
+            if !game.menu_themes_supported || !game.menu_light_themes_supported {
+                return true;
+            }
+            // An existing host can predate the capability fields within the same test version.
+            // A matching host alone does not establish that the guest calls the cadence hook.
+            !game.split_screen_60fps_supported
+                || !game.bloom_supported
+                || (!game.temporal_upscaling_supported
+                    || !game.romfs_long_paths_supported
+                    || !game.nextendo_session_supported
+                    || !game.live_settings_supported)
+                    && !load::<Value>(&self.root.join("prebuilt/host/manifest.json")).is_ok_and(
+                        |host| {
+                            host["files"]["mk8drecomp.exe"].as_str()
+                                == Some(game.executable.sha256.as_str())
+                        },
+                    )
+        });
+        let candidate_stale = candidate_exists
+            && (candidate_version.as_deref() != Some(update::CURRENT)
+                || !nextendo_supported
+                || candidate
+                    .as_ref()
+                    .is_some_and(|game| !game.direct_lan_guest_supported)
+                || runtime_upgrade);
         let dlc =
             mk8_installer::dlc::status(&self.local, install.as_ref().or(self.candidate().as_ref()));
         let ctgp = mk8_installer::ctgp::status(
@@ -763,11 +958,25 @@ impl App {
             .map(|room| room.code.clone())
             .or_else(|| self.steam_room.as_ref().map(|room| room.code.clone()))
             .or(p2p_code);
-        json!({"dlc":dlc,"dlc_import":self.dlc_import.status(),"ctgp":ctgp,"ctgp_import":self.ctgp_import.status(),"mii_preparation":mii_preparation,"package_import":package_import,"import_ready":package_import && imported.is_dir(),"room_menu":self.room_menu,"setup":self.setup.status(),"tools":self.tools,"tools_ready":self.tools.iter().all(|c|c["ok"]==true),"native_dialogs":self.window.is_some(),"build":build,"candidate":candidate_exists,"candidate_stale":candidate_stale,"candidate_version":candidate_version,"game_exit":self.game_exit,"installed":install.is_some(),"profile":install.as_ref().map(|i|&i.profile),"gameplay_verified":install.as_ref().is_some_and(|i|i.gameplay_verified),"game_pid":self.game.as_ref().map(|c|c.id()),"session":{"hosting":self.host.is_some(),"internet_available":relay::url().is_some(),"room_code":room_code,"stun_endpoint":self.host.as_ref().and_then(|h|h.stun_endpoint.map(|e|e.to_string())),"steam_available":steam_status.dll_found,"steam_active":self.steam_room.is_some(),"steam_lobby_id":self.steam_room.as_ref().map(|r|r.lobby_id.to_string()),"steam_persona":steam_status.persona,"steam_ready":steam_status.ready,"steam_invites":self.steam_invites.len(),"steam_error":self.steam_error,"pending_play":self.pending_play.map(|play| play.role),"steam_auto_join":self.steam_auto_join,"relay":self.host.as_ref().map(|h|h.address.to_string()),"participants":self.host.as_ref().map(|h|h.connected()).unwrap_or(0),"connected":self.gateway.as_ref().is_some_and(|g|g.connected()),"slot":self.gateway.as_ref().map(|g|g.slot),"bridge_port":self.gateway.as_ref().map(|g|g.local_addr.port()),"diagnostic_only":install.is_none() && self.candidate().is_none()},"checks":mk8_installer::inspect(&paths),"files":game_files(&self.config, package_import && imported.is_dir()),"upstream":"Runtime local","root":self.root,"version":update::CURRENT,"updates":{"configured":update::repository().is_some(),"installable":update::installable()},"last_report":self.last_report,"data_dir":self.local,"windowed":self.window.is_some()})
+        let mut status = json!({"dlc":dlc,"dlc_import":self.dlc_import.status(),"ctgp":ctgp,"ctgp_import":self.ctgp_import.status(),"mii_preparation":mii_preparation,"package_import":package_import,"import_ready":package_import && imported.is_dir(),"room_menu":self.room_menu,"setup":self.setup.status(),"tools":self.tools,"tools_ready":self.tools.iter().all(|c|c["ok"]==true),"native_dialogs":self.window.is_some(),"build":build,"candidate":candidate_exists,"candidate_stale":candidate_stale,"candidate_version":candidate_version,"game_exit":self.game_exit,"installed":install.is_some(),"profile":install.as_ref().map(|i|&i.profile),"gameplay_verified":install.as_ref().is_some_and(|i|i.gameplay_verified),"game_pid":self.game.as_ref().map(|c|c.id()),"session":{"hosting":self.host.is_some(),"internet_available":relay::url().is_some(),"room_code":room_code,"stun_endpoint":self.host.as_ref().and_then(|h|h.stun_endpoint.map(|e|e.to_string())),"steam_available":steam_status.dll_found,"steam_active":self.steam_room.is_some(),"steam_lobby_id":self.steam_room.as_ref().map(|r|r.lobby_id.to_string()),"steam_persona":steam_status.persona,"steam_ready":steam_status.ready,"steam_invites":self.steam_invites.len(),"steam_error":self.steam_error,"pending_play":self.pending_play.map(|play| play.role),"steam_auto_join":self.steam_auto_join,"relay":self.host.as_ref().map(|h|h.address.to_string()),"participants":self.host.as_ref().map(|h|h.connected()).unwrap_or(0),"connected":self.gateway.as_ref().is_some_and(|g|g.connected()),"slot":self.gateway.as_ref().map(|g|g.slot),"bridge_port":self.gateway.as_ref().map(|g|g.local_addr.port()),"diagnostic_only":install.is_none() && self.candidate().is_none()},"checks":mk8_installer::inspect(&paths),"files":game_files(&self.config, package_import && imported.is_dir()),"upstream":"Runtime local","root":self.root,"version":update::CURRENT,"updates":{"configured":update::repository().is_some(),"installable":update::installable()},"last_report":self.last_report,"data_dir":self.local,"windowed":self.window.is_some(),"platform":std::env::consts::OS});
+        status["session"]["direct_lan_guest_supported"] = json!(install
+            .as_ref()
+            .or(candidate.as_ref())
+            .is_some_and(|game| game.direct_lan_guest_supported));
+        status["nextendo_trusted"] = json!(mk8_installer::nextendo_trusted(&self.local));
+        status["nextendo_refusal_message"] = json!(self.nextendo_refusal.as_deref().map(|code| {
+            crate::game_session::nextendo_message(code, &crate::language::effective(&self.local))
+        }));
+        status["steam_join_after_mii"] = json!(self.steam_join_after_mii.is_some());
+        status["nextendo_supported"] =
+            json!(nextendo_supported || mk8_installer::nextendo_test_configured());
+        status["nextendo_game_key"] = json!(mk8_installer::NEXTENDO_GAME_KEY);
+        status
     }
     fn handle(&mut self, method: &Method, path: &str, body: &str) -> Result<Value> {
         self.dlc_import.poll();
         self.ctgp_import.poll();
+        self.poll_fsr();
         if method == &Method::Post
             && self.imports_running()
             && !matches!(path, "/api/language" | "/api/browse" | "/api/dlc/files")
@@ -783,10 +992,28 @@ impl App {
                     value["keys"].as_str().unwrap_or(""),
                 ))
             }
-            ("GET", "/api/settings") => crate::game_settings::read(&self.local),
+            ("GET", "/api/graphics") => self.graphics.status(&self.local),
+            ("POST", "/api/graphics/license") => {
+                let value: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+                crate::graphics::license(&self.local, value["vendor"].as_str().unwrap_or(""))
+            }
+            ("POST", "/api/graphics/install") => {
+                let value: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+                self.graphics.start(&self.local, &value)
+            }
+            ("GET", "/api/settings") => {
+                let mut settings = crate::game_settings::read(&self.local, self.menu_build())?;
+                settings["split_screen_60fps_supported"] =
+                    json!(self.split_screen_60fps_supported());
+                settings["bloom_supported"] = json!(self.bloom_supported());
+                Ok(settings)
+            }
+            ("GET", "/api/debug-options") => Ok(json!(crate::debug_options::read(&self.local)?)),
             ("GET", "/api/fonts") => crate::fonts::status(&self.local),
             ("POST", "/api/settings")
+            | ("POST", "/api/debug-options")
             | ("POST", "/api/fonts")
+            | ("POST", "/api/fsr/settings")
             | ("POST", "/api/dlc/toggle")
             | ("POST", "/api/dlc/import")
             | ("POST", "/api/ctgp/toggle")
@@ -810,6 +1037,22 @@ impl App {
                 pipeline
                     .try_lock()
                     .map_err(|_| "Já existe uma preparação usando esta pasta de dados.")?;
+                if path == "/api/debug-options" {
+                    let mut options: crate::debug_options::Options =
+                        serde_json::from_str(body).map_err(|e| e.to_string())?;
+                    let previous = crate::debug_options::read(&self.local)?.legacy_native;
+                    if options
+                        .legacy_native
+                        .is_some_and(|value| value != previous.unwrap_or(false))
+                    {
+                        return Err("Selecione o tema do menu em Configurações → Vídeo.".into());
+                    }
+                    options.legacy_native = previous;
+                    crate::debug_options::write(&self.local, &options)?;
+                    return Ok(
+                        json!({"message":"Preferência salva. A alteração vale ao iniciar o jogo."}),
+                    );
+                }
                 if path == "/api/fonts" {
                     let value: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
                     let result = if let Some(directory) = value["directory"].as_str() {
@@ -827,11 +1070,47 @@ impl App {
                     );
                 }
                 if path == "/api/settings" {
-                    let value: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
-                    crate::game_settings::write(&self.local, &value)?;
+                    let mut value: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+                    if let Some(mode) = value["upscaler"].as_str() {
+                        crate::graphics::validate(&self.local, mode)?;
+                    }
+                    if value.get("bloom").is_some() && !self.bloom_supported() {
+                        // A full-form client can echo an unavailable option while saving another preference.
+                        if value["bloom"]
+                            != crate::game_settings::read(&self.local, self.menu_build())?["values"]
+                                ["bloom"]
+                        {
+                            return Err("Atualize o runtime do jogo para ajustar o bloom.".into());
+                        }
+                        if let Some(patch) = value.as_object_mut() {
+                            patch.remove("bloom");
+                        }
+                    }
+                    if value.get("split_screen_60fps").is_some()
+                        && !self.split_screen_60fps_supported()
+                    {
+                        // Full-form clients can echo a disabled field while updating unrelated settings.
+                        let current = crate::game_settings::read(&self.local, self.menu_build())?;
+                        if value["split_screen_60fps"] != current["values"]["split_screen_60fps"] {
+                            return Err("Atualize a build usada para jogar para ajustar os 60 FPS em tela dividida.".into());
+                        }
+                        if let Some(patch) = value.as_object_mut() {
+                            patch.remove("split_screen_60fps");
+                        }
+                    }
+                    crate::game_settings::write(&self.local, &value, self.menu_build())?;
                     return Ok(
                         json!({"message":"Configurações salvas. As alterações valem ao iniciar o jogo."}),
                     );
+                }
+                if path == "/api/fsr/settings" {
+                    let settings: crate::fsr::Settings =
+                        serde_json::from_str(body).map_err(|_| "Preferências FSR inválidas.")?;
+                    crate::fsr::write_settings(&self.local, &settings)?;
+                    return Ok(json!({
+                        "settings": settings,
+                        "message": "Preferências FSR salvas. Valem ao iniciar o jogo.",
+                    }));
                 }
                 let install = self.installation().or_else(|| self.candidate()).ok_or(
                     if path.starts_with("/api/ctgp/") {
@@ -900,17 +1179,13 @@ impl App {
                 let package = value["package"]
                     .as_str()
                     .filter(|s| !s.is_empty())
-                    .ok_or("Selecione o NSP do DLC.")?;
+                    .ok_or("Selecione o NSP/NSZ do DLC.")?;
                 if !install.dlc_supported {
                     return Err("Atualize a build para usar DLC.".into());
                 }
                 let package = Path::new(package);
-                if !package.is_file()
-                    || !package
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("nsp"))
-                {
-                    return Err("Selecione o NSP do DLC.".into());
+                if !is_dlc_package(package) {
+                    return Err("Selecione o NSP/NSZ do DLC.".into());
                 }
                 let keys = dlc_keys(
                     &self.config,
@@ -932,9 +1207,81 @@ impl App {
             }
             ("GET", "/api/dlc/log") => Ok(json!({"text":self.log_tail("dlc.log")?})),
             ("GET", "/api/ctgp/log") => Ok(json!({"text":self.log_tail("ctgp.log")?})),
+            ("GET", "/api/fsr") => self.fsr_page(),
+            ("POST", "/api/fsr/license") => {
+                let dir = crate::fsr::data_dir();
+                let text = crate::fsr::install::fetch_license(&dir)?;
+                Ok(json!({
+                    "text": text,
+                    "license": crate::fsr::license_status(&dir),
+                    "message": "Licença da AMD carregada da fonte oficial (SDK v2.4.0).",
+                }))
+            }
+            ("POST", "/api/fsr/accept") => {
+                let dir = crate::fsr::data_dir();
+                crate::fsr::install::accept_terms(&dir)?;
+                Ok(json!({
+                    "license": crate::fsr::license_status(&dir),
+                    "message": "Termos da AMD aceitos. O download só começa quando você pedir.",
+                }))
+            }
+            ("POST", "/api/fsr/install") => {
+                self.poll_fsr();
+                if self.fsr_job.is_some() {
+                    return Err("A instalação do FSR já está em andamento.".into());
+                }
+                self.status();
+                if self.session_busy()
+                    || self.setup.running()
+                    || self.imports_running()
+                    || self.build.poll().state == "running"
+                {
+                    return Err(
+                        "Feche o jogo e aguarde a operação atual antes de instalar o FSR.".into(),
+                    );
+                }
+                let settings = crate::fsr::read_settings(&self.local)?;
+                if cfg!(windows) {
+                    let gate = crate::fsr::fsr4_gate(&settings);
+                    if crate::fsr::fsr4_selection_blocked(&settings, &gate) {
+                        return Err(gate.reason);
+                    }
+                }
+                if cfg!(target_os = "linux")
+                    && settings.upscaling != "3.1.6"
+                    && settings.upscaling != "4.1.2"
+                    && settings.frame_generation != "fsr3"
+                {
+                    return Err(
+                        "Nada para instalar: selecione FSR 3.1.6, FSR 4.1.2 ou FSR 3 nos componentes locais."
+                            .into(),
+                    );
+                }
+                if !crate::fsr::terms_accepted(&crate::fsr::data_dir()) {
+                    return Err("Leia e aceite a licença da AMD antes de baixar o SDK.".into());
+                }
+                self.fsr_job = Some(crate::fsr::install::Job::start(
+                    &self.root,
+                    &self.local,
+                    &settings,
+                )?);
+                self.fsr_page()
+            }
+            ("POST", "/api/fsr/cancel") => {
+                if let Some(mut job) = self.fsr_job.take() {
+                    job.cancel()?;
+                }
+                Ok(json!({"message":"Instalação do FSR cancelada."}))
+            }
+            ("GET", "/api/fsr/log") => Ok(json!({
+                "text": crate::fsr::install::log_tail(&crate::fsr::data_dir(), 200),
+            })),
             ("GET", "/api/status") => Ok(self.status()),
             ("GET", "/api/config") => Ok(serde_json::to_value(&self.config).unwrap()),
             ("GET", "/api/username") => Ok(json!(self.username)),
+            ("GET", "/api/mii/active") => Ok(json!(
+                mk8_installer::mii::read(&self.local)?.map(|profile| profile.appearance.name)
+            )),
             ("GET", "/api/mii") => Ok(json!({"active":mk8_installer::mii::read(&self.local)?,
                 "profiles":mk8_installer::mii::list(&self.local)?, "menu":self.mii_menu})),
             ("GET", "/api/mii/menu") => Ok(json!({"menu":self.mii_menu})),
@@ -1164,9 +1511,9 @@ impl App {
                 let dlc = if package.is_empty() {
                     None
                 } else {
-                    if !Path::new(package).is_file() {
+                    if !is_dlc_package(Path::new(package)) {
                         return Err(
-                            "Selecione um NSP válido para a DLC opcional ou deixe o campo vazio."
+                            "Selecione um NSP/NSZ válido para a DLC opcional ou deixe o campo vazio."
                                 .into(),
                         );
                     }
@@ -1368,18 +1715,26 @@ impl App {
                 steam::invite(&self.local, room.lobby_id, friend)?;
                 Ok(json!({"message":"Convite enviado pela Steam."}))
             }
+            ("POST", "/api/steam/claim-join") => Ok(json!(self.steam_join_after_mii.take())),
             ("POST", "/api/steam/join") => {
                 let value: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
                 let lobby = value["lobby"].as_str().ok_or("Sala inválida.")?.to_owned();
                 if lobby.is_empty() || !lobby.chars().all(|c| c.is_ascii_digit()) {
                     return Err("Sala inválida.".into());
                 }
-                self.steam_join(&lobby)?;
-                Ok(json!({"message": if self.steam_auto_join {
-                    "Conectado à sala do seu amigo. O jogo abre sozinho e entra na sala."
-                } else {
-                    "Conectado pela Steam. No jogo, escolha seu Mii e abra LAN Play → Lobby para entrar na sala do amigo."
-                }}))
+                let two_player_guest = match value.get("players").map(Value::as_u64) {
+                    None | Some(Some(1)) => false,
+                    Some(Some(2)) => true,
+                    _ => return Err("Escolha 1 ou 2 jogadores neste PC.".into()),
+                };
+                self.steam_join(&lobby, two_player_guest)?;
+                Ok(
+                    json!({"message": if self.pending_play.is_some_and(|play| play.automatic) {
+                        "Conectado pela Steam. Escolha a sala do anfitrião na lista LAN."
+                    } else {
+                        "Conectado pela Steam. No jogo, escolha seu Mii e abra LAN Play → Lobby para entrar na sala do amigo."
+                    }}),
+                )
             }
             ("POST", "/api/steam/dismiss") => {
                 let value: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
@@ -1469,10 +1824,22 @@ impl App {
                 }
                 Ok(json!({"message":"Sessão encerrada."}))
             }
+            ("POST", "/api/nextendo/trust") => {
+                let value: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+                mk8_installer::trust_nextendo(&self.local, value["key"].as_str().unwrap_or(""))?;
+                Ok(json!({}))
+            }
             ("POST", "/api/play") => {
                 self.status();
                 let value: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
-                let pid = self.start_game(value["online"].as_bool().unwrap_or(false), None)?;
+                let nextendo = value["nextendo"].as_bool().unwrap_or(false);
+                let pid =
+                    self.start_game(value["online"].as_bool().unwrap_or(false), None, nextendo)?;
+                if nextendo {
+                    return Ok(
+                        json!({"message":"Abrindo o Nextendo. No jogo, selecione Online Play."}),
+                    );
+                }
                 Ok(
                     json!({"message":format!("Processo iniciado ({pid}). Corrida ainda não verificada.")}),
                 )
@@ -1509,12 +1876,20 @@ impl App {
                 .map_err(|e| e.to_string())?;
                 Ok(json!({"message":"Pasta aberta."}))
             }
-            ("POST", "/api/support/github") => {
+            ("POST", "/api/support/github" | "/api/nextendo/account") => {
                 if self.window.is_none() {
-                    return Err("Na prévia web, use o link do GitHub diretamente.".into());
+                    return Err("Na prévia web, use o link diretamente.".into());
                 }
                 let value: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
-                let url = if value["list"] == true {
+                let nextendo = path == "/api/nextendo/account";
+                let url = if nextendo {
+                    tauri::Url::parse(if value["register"] == true {
+                        "https://nextendo.network/register"
+                    } else {
+                        "https://nextendo.network/account"
+                    })
+                    .map_err(|e| e.to_string())?
+                } else if value["list"] == true {
                     tauri::Url::parse("https://github.com/Vnnc1/MK8-online/issues")
                         .map_err(|e| e.to_string())?
                 } else {
@@ -1545,6 +1920,9 @@ impl App {
                     command
                 };
                 command.spawn().map_err(|e| e.to_string())?;
+                if nextendo {
+                    return Ok(json!({}));
+                }
                 Ok(json!({"message":"Abrindo o GitHub no navegador. Revise antes de publicar."}))
             }
             ("POST", "/api/update/check") => update::check(),
@@ -1593,12 +1971,17 @@ fn binary_response(req: Request, code: u16, bytes: Vec<u8>, mime: &str) {
 /// answering status requests while the dialog is open.
 fn browse(req: Request, body: &str, parent: &DialogParent) {
     let value: Value = serde_json::from_str(body).unwrap_or_default();
-    let language = value["language"].as_str().unwrap_or("pt-BR").to_string();
+    let language = value["language"].as_str().unwrap_or("en").to_string();
     let current = value["current"].as_str().unwrap_or("").to_string();
     let filter = match value["kind"].as_str() {
         Some("dlc") => Some((
-            crate::language::pick(&language, "NSP do DLC", "DLC NSP", "NSP del DLC"),
-            &["nsp"][..],
+            crate::language::pick(
+                &language,
+                "NSP/NSZ do DLC",
+                "DLC NSP/NSZ",
+                "NSP/NSZ del DLC",
+            ),
+            &["nsp", "nsz"][..],
         )),
         Some("nacp") => Some((
             crate::language::pick(
@@ -1630,6 +2013,23 @@ fn browse(req: Request, body: &str, parent: &DialogParent) {
                 "Biblioteca de partes Mii",
             ),
             &["dat"][..],
+        )),
+        Some("fsr-library") => Some((
+            crate::language::pick(&language, "Provedor FFX", "FFX provider", "Proveedor FFX"),
+            if cfg!(windows) {
+                &["dll"][..]
+            } else {
+                &["so"][..]
+            },
+        )),
+        Some("dxc") => Some((
+            crate::language::pick(
+                &language,
+                "Compilador DXC",
+                "DXC compiler",
+                "Compilador DXC",
+            ),
+            &["*"][..],
         )),
         _ => None,
     };
@@ -1786,6 +2186,24 @@ pub fn serve(mut app: App, server: Server, authority: String, url: String, token
             );
             continue;
         }
+        if method == Method::Get && path == "/fsr.css" {
+            response(
+                req,
+                200,
+                include_str!("../web/fsr.css").into(),
+                "text/css; charset=utf-8",
+            );
+            continue;
+        }
+        if method == Method::Get && path == "/fsr.js" {
+            response(
+                req,
+                200,
+                include_str!("../web/fsr.js").into(),
+                "text/javascript; charset=utf-8",
+            );
+            continue;
+        }
         if method == Method::Get && path == "/app.js" {
             response(
                 req,
@@ -1795,16 +2213,37 @@ pub fn serve(mut app: App, server: Server, authority: String, url: String, token
             );
             continue;
         }
-        if method == Method::Get && path == "/vendor/ffl/ffl-emscripten.wasm" {
-            binary_response(
-                req,
-                200,
-                include_bytes!("../web/vendor/ffl/ffl-emscripten.wasm").to_vec(),
-                "application/wasm",
-            );
-            continue;
-        }
         if method == Method::Get {
+            let asset: Option<(&[u8], &str)> = match path.as_str() {
+                "/menu-themes/default.webp" => Some((
+                    include_bytes!("../web/menu-themes/default.webp"),
+                    "image/webp",
+                )),
+                "/menu-themes/nes.webp" => {
+                    Some((include_bytes!("../web/menu-themes/nes.webp"), "image/webp"))
+                }
+                "/menu-themes/simple-light.webp" => Some((
+                    include_bytes!("../web/menu-themes/simple-light.webp"),
+                    "image/webp",
+                )),
+                "/menu-themes/nes-light.webp" => Some((
+                    include_bytes!("../web/menu-themes/nes-light.webp"),
+                    "image/webp",
+                )),
+                "/menu-themes/native.webp" => Some((
+                    include_bytes!("../web/menu-themes/native.webp"),
+                    "image/webp",
+                )),
+                "/vendor/ffl/ffl-emscripten.wasm" => Some((
+                    include_bytes!("../web/vendor/ffl/ffl-emscripten.wasm"),
+                    "application/wasm",
+                )),
+                _ => None,
+            };
+            if let Some((bytes, mime)) = asset {
+                binary_response(req, 200, bytes.to_vec(), mime);
+                continue;
+            }
             let model_asset = match path.as_str() {
                 "/mii-composer.js" => Some((
                     include_str!("../web/mii-composer.js"),
@@ -1927,6 +2366,16 @@ pub fn serve(mut app: App, server: Server, authority: String, url: String, token
             );
             continue;
         }
+        if let Some(language) = req
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("X-MK8-Language"))
+        {
+            let language = language.value.as_str();
+            if crate::language::valid(language) {
+                language.clone_into(&mut app.browser_language);
+            }
+        }
         if method == Method::Get && path == "/api/report/download" {
             match report::download(&app.local, app.last_report.as_deref()) {
                 Ok(bytes) => binary_response(req, 200, bytes, "application/zip"),
@@ -2023,6 +2472,36 @@ pub fn serve(mut app: App, server: Server, authority: String, url: String, token
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn failed_game_keeps_the_reason_in_status_and_a_report() {
+        let root = std::env::temp_dir().join(format!("mk8-failed-game-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone(), root.clone(), Config::default(), None);
+        let fatal = "SDL_Vulkan_CreateSurface: VK_KHR_win32_surface extension is not enabled";
+        fs::write(
+            root.join("game.log"),
+            format!("{}\nFATAL: {fatal}\n", "x".repeat(40_000)),
+        )
+        .unwrap();
+        let exit = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "exit 1"])
+            .status()
+            .unwrap();
+        assert!(app.finish_game(exit).contains(fatal));
+        assert!(app.game_exit.as_deref().unwrap().contains(fatal));
+        let extracted = std::process::Command::new("tar.exe")
+            .arg("-xOf")
+            .arg(app.last_report.as_ref().unwrap())
+            .arg("report.json")
+            .output()
+            .unwrap();
+        assert!(extracted.status.success());
+        let report: Value = serde_json::from_slice(&extracted.stdout).unwrap();
+        assert_eq!(report["launcher"]["game_exit_detail"], fatal);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn dlc_file_readiness_uses_real_files_and_the_importers_key_selection() {
         let root = std::env::temp_dir().join(format!("mk8-dlc-fields-{}", std::process::id()));
@@ -2059,6 +2538,42 @@ mod tests {
         assert_eq!(state["keys_ok"], false);
         fs::remove_dir_all(root).unwrap();
     }
+    #[cfg(windows)]
+    #[test]
+    fn nextendo_exit_reports_only_the_current_login_refusal() {
+        let root = std::env::temp_dir().join(format!("mk8-nextendo-exit-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone(), root.clone(), Config::default(), None);
+        let path = root.join("game.log");
+        let denied = "[nextendo] online status: refused: discord_unlinked\r\n";
+        for (nextendo, exit, log, expected) in [
+            (true, "2", denied, Some("discord_unlinked")),
+            (true, "2", "[nextendo] online status: refused: maintenance\n", Some("maintenance")),
+            (true, "2", "[nextendo] online status: refused: discord_unlinked\n[nextendo] online status: ok\n", None),
+            (true, "2", "BAAS adapter unavailable or online access refused.\n", None),
+            (true, "2", "[nextendo] online status: refused: discord_unlinked\nFATAL: runtime failed\n", None),
+            (true, "2", "[nextendo] online status: refused: invalid text", None),
+            (true, "1", denied, None),
+            (false, "2", denied, None),
+        ] {
+            fs::write(&path, log).unwrap();
+            app.nextendo_log = nextendo.then(|| fs::File::open(&path).unwrap());
+            if nextendo {
+                // Another launcher can rotate the file after this game releases its lock.
+                mk8_installer::rotate_game_log(&root).unwrap();
+                fs::write(&path, "[nextendo] online status: refused: unrelated\n").unwrap();
+            }
+            let mut child = std::process::Command::new("cmd")
+                .args(["/d", "/c", "exit", exit]).spawn().unwrap();
+            child.wait().unwrap();
+            app.game = Some(child);
+            app.poll_game();
+            assert_eq!(app.nextendo_refusal.as_deref(), expected);
+            assert!(app.nextendo_log.is_none());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn dlc_changes_refuse_resources_owned_by_another_session() {
         let root = std::env::temp_dir().join(format!("mk8-dlc-lock-{}", std::process::id()));
@@ -2100,6 +2615,41 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("Já existe uma preparação"), "{error}");
         drop(pipeline);
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fsr_settings_route_persists_and_rejects_the_unavailable_mlfi_mode() {
+        let root = std::env::temp_dir().join(format!("mk8-fsr-route-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone(), root.clone(), Config::default(), None);
+        let provider = if cfg!(windows) {
+            r"C:\\fsr\\provider.dll"
+        } else {
+            "/opt/fsr.so"
+        };
+        let body = format!(
+            r#"{{"upscaling":"3.1.6","provider_lib":"{provider}","frame_generation":"fsr3","dxc":"/opt/dxc","legacy_abi":true}}"#
+        );
+        let value = app
+            .handle(&Method::Post, "/api/fsr/settings", &body)
+            .unwrap();
+        assert_eq!(value["settings"]["upscaling"], "3.1.6");
+        assert_eq!(value["settings"]["frame_generation"], "fsr3");
+        let settings = crate::fsr::read_settings(&root).unwrap();
+        assert_eq!(settings.upscaling, "3.1.6");
+        assert!(settings.legacy_abi);
+
+        let error = app
+            .handle(
+                &Method::Post,
+                "/api/fsr/settings",
+                r#"{"upscaling":"off","provider_lib":"","frame_generation":"fsr4","dxc":"","legacy_abi":false}"#,
+            )
+            .unwrap_err();
+        assert!(error.contains("FSR 4 MLFI"), "{error}");
+        assert_eq!(crate::fsr::read_settings(&root).unwrap(), settings);
         drop(app);
         fs::remove_dir_all(root).unwrap();
     }
@@ -2207,7 +2757,8 @@ mod tests {
             assert_eq!(
                 PendingPlay {
                     role,
-                    automatic: true
+                    automatic: true,
+                    two_player_guest: false,
                 }
                 .auto_lan(),
                 Some(role)
@@ -2215,6 +2766,7 @@ mod tests {
             let manual = PendingPlay {
                 role,
                 automatic: false,
+                two_player_guest: false,
             };
             assert_eq!(manual.role, role);
             assert_eq!(manual.auto_lan(), None);
@@ -2227,6 +2779,14 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let mut app = App::new(root.clone(), root.clone(), Config::default(), None);
         assert!(app.steam_auto_join);
+        for players in ["0", "3", "null", "true", "\"2\""] {
+            let body = format!(r#"{{"lobby":"123","players":{players}}}"#);
+            assert_eq!(
+                app.handle(&Method::Post, "/api/steam/join", &body)
+                    .unwrap_err(),
+                "Escolha 1 ou 2 jogadores neste PC."
+            );
+        }
         app.handle(
             &Method::Post,
             "/api/steam/navigation",
@@ -2253,7 +2813,15 @@ mod tests {
         let root = std::env::temp_dir().join(format!("mk8-prepare-dlc-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("dlc.json"), b"previous preference").unwrap();
-        let mut app = App::new(root.clone(), root.clone(), Config::default(), None);
+        let config = Config {
+            prod_keys: root
+                .join("missing-keys/prod.keys")
+                .to_string_lossy()
+                .into_owned(),
+            ..Config::default()
+        };
+        assert!(!Path::new(&config.prod_keys).exists());
+        let mut app = App::new(root.clone(), root.clone(), config, None);
         // A previous candidate must not start the new import while tools install.
         app.prepare_after_setup = true;
         app.prepare_dlc = Some(root.join("optional.nsp"));
@@ -2282,6 +2850,37 @@ mod tests {
     }
 
     #[test]
+    fn matching_prebuilt_host_does_not_vouch_for_an_old_guest() {
+        let root = std::env::temp_dir().join(format!("mk8-guest-upgrade-{}", std::process::id()));
+        fs::create_dir_all(root.join("prebuilt/host")).unwrap();
+        let hash = "a".repeat(64);
+        save(
+            &root.join("prebuilt/host/manifest.json"),
+            &json!({"files":{"mk8drecomp.exe":hash}}),
+        )
+        .unwrap();
+        save(
+            &root.join("built-with.json"),
+            &json!({"version":update::CURRENT}),
+        )
+        .unwrap();
+        let mut candidate = json!({"schema":2, "identity":"fixture", "profile":"mk8d-smm2-experimental",
+            "executable":{"path":"fixture.exe","sha256":hash,"bytes":1}, "files":{},
+            "data_root":".","shader_root":".","gameplay_verified":false,"nextendo_supported":true,
+            "menu_themes_supported":true,"menu_light_themes_supported":true,"bloom_supported":true,
+            "direct_lan_guest_supported":true});
+        let mut app = App::new(root.clone(), root.clone(), Config::default(), None);
+        save(&root.join("candidate.json"), &candidate).unwrap();
+        // Every other capability is current: only the missing guest cadence hook makes it stale.
+        assert_eq!(app.status()["candidate_stale"], true);
+        candidate["split_screen_60fps_supported"] = json!(true);
+        save(&root.join("candidate.json"), &candidate).unwrap();
+        assert_eq!(app.status()["candidate_stale"], false);
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn candidate_network_identity_uses_content_and_launch_still_checks_hashes() {
         let root =
             std::env::temp_dir().join(format!("mk8-network-manifest-{}", std::process::id()));
@@ -2304,6 +2903,16 @@ mod tests {
             dlc_supported: false,
             pack_supported: false,
             cups_supported: false,
+            nextendo_supported: false,
+            temporal_upscaling_supported: false,
+            romfs_long_paths_supported: false,
+            nextendo_session_supported: false,
+            live_settings_supported: false,
+            menu_themes_supported: false,
+            menu_light_themes_supported: false,
+            split_screen_60fps_supported: false,
+            bloom_supported: false,
+            direct_lan_guest_supported: false,
         };
         save(&root.join("candidate.json"), &install).unwrap();
         let mut app = App::new(root.clone(), root.clone(), Config::default(), None);

@@ -37,6 +37,11 @@ async function space() {
   }
   try {
     const result = await api("space", { path });
+    if (result.hard_links === false) {
+      i18n.text(text, `A pasta de dados está num disco ${result.file_system}, que não aceita hard links. A preparação do jogo precisa de um disco NTFS: escolha outra pasta ou converta o disco para NTFS.`);
+      text.classList.add("bad");
+      return;
+    }
     if (result.free_gib === null) {
       i18n.text(text, "");
       return;
@@ -81,6 +86,7 @@ let polling = 0;
 async function finish(launch) {
   const open = $("open");
   const close = $("close");
+  if (open.disabled) return;
   open.disabled = close.disabled = true;
   i18n.text($("finish-error"), "");
   try {
@@ -106,19 +112,20 @@ async function poll() {
     const progress = await api("progress");
     draw(progress);
     if (progress.state === "done") {
-      clearInterval(polling);
       show("done");
       if ($("launch").checked) void finish(true);
+      return;
     } else if (progress.state === "failed") {
-      clearInterval(polling);
       i18n.text($("progress-title"), "A instalação não terminou");
       i18n.text($("progress-error"), progress.error);
       $("retry-actions").hidden = false;
       $("bar").parentElement.classList.add("failed");
+      return;
     }
   } catch (error) {
     i18n.text($("progress-error"), error.message);
   }
+  polling = setTimeout(poll, 200);
 }
 async function install() {
   i18n.text($("paths-error"), "");
@@ -136,8 +143,8 @@ async function install() {
   i18n.text($("done-where"), "Programa em " + body.app + " · dados em " + body.data);
   draw({ percent: 0, step: "Preparando" });
   show("progress");
-  clearInterval(polling);
-  polling = setInterval(poll, 200);
+  clearTimeout(polling);
+  polling = setTimeout(poll, 200);
 }
 $("install").onclick = install;
 $("retry").onclick = install;

@@ -13,6 +13,74 @@ from native import DEFAULT_COMPILER
 
 @unittest.skipUnless(DEFAULT_COMPILER.is_file(), 'Native compiler required')
 class LocalMiiTests(unittest.TestCase):
+    def test_saved_mii_refresh_and_index_use_real_database_entry(self):
+        from host import prepare_host_sources
+        from native import compiler_env
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = prepare_host_sources(ROOT/'upstream/smm2recomp/recomp', root/'host')
+            text = (runtime/'services/mii.c').read_text(encoding='utf-8')
+            body = text[text.index('void mii_default_charinfo'):text.index('static void static_service')]
+            program = root/'refresh.c'
+            program.write_text(r'''
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <assert.h>
+#include "ipc.h"
+#define LOG(...) ((void)0)
+#define NET_BACKEND_OCW 1
+static int net_backend(void) { return 0; }
+''' + body + r'''
+static IpcResp call(unsigned cmd, const uint8_t *data, unsigned bytes) {
+    IpcReq req = {.cmd=cmd, .data=data, .data_size=bytes};
+    IpcResp resp = {0}; database(NULL, &req, &resp); return resp;
+}
+int main(void) {
+    _putenv_s("MK8_MII_CHARINFO", ""); _putenv_s("MK8_MII_FACE", "");
+    _putenv_s("MK8_MII_ID", "00112233445566778099aabbccddeeff");
+    _putenv_s("MK8_MII_NAME", "Player"); _putenv_s("MK8_MII_COLOR", "3");
+    _putenv_s("MK8_MII_GENDER", "0");
+    uint8_t saved[0x5c] = {0}, current[0x58];
+    assert(mk8_profile_charinfo(current)); memcpy(saved, current, sizeof current);
+    assert(mk8_launcher_mii_matches(current));
+    current[0x27] ^= 1; assert(!mk8_launcher_mii_matches(current)); current[0x27] ^= 1;
+    saved[0x58] = 1;
+    IpcResp r = call(5, saved, sizeof saved);
+    assert(r.result == 0x67e && r.data_size == 0x58); // unchanged
+    assert(!memcmp(r.data, current, sizeof current));
+    saved[0x27] = 2;
+    r = call(5, saved, sizeof saved);
+    assert(!r.result && r.data_size == 0x58 && mk8_charinfo_valid(r.data));
+    assert(!memcmp(r.data, current, sizeof current)); // latest appearance, same identity
+    r = call(21, saved, 0x58); assert(!r.result && r.data_size == 4 && *(int32_t *)r.data == 0);
+    saved[0x58] = 2; assert(call(5, saved, sizeof saved).result == 0x87e);
+    saved[0x58] = 1; saved[0x2b] = 1;
+    assert(call(5, saved, sizeof saved).result == 0x87e);
+    saved[0x2b] = 0; saved[0] ^= 1;
+    assert(call(5, saved, sizeof saved).result == 0x87e);
+    r = call(21, saved, 0x58); assert(r.result == 0x87e && *(int32_t *)r.data == -1);
+    saved[0] ^= 1; saved[0x31] = 255;
+    assert(call(5, saved, sizeof saved).result == 0xc87e);
+    assert(call(21, saved, 0x58).result == 0xc87e);
+    for (unsigned n=0; n<0x5c; n++) assert(call(5, saved, n).result == 0x27e);
+    for (unsigned n=0; n<0x58; n++) assert(call(21, saved, n).result == 0x27e);
+    assert(call(5, NULL, 0x5c).result == 0x27e);
+    memcpy(saved, current, sizeof current); _putenv_s("MK8_MII_ID", "");
+    assert(!mk8_launcher_mii_matches(current));
+    assert(call(5, saved, sizeof saved).result == 0x87e);
+    assert(call(21, saved, 0x58).result == 0x87e);
+    return 0;
+}
+''', encoding='utf-8')
+            exe = root/'refresh.exe'
+            subprocess.run([str(DEFAULT_COMPILER), 'cc', '-target', 'x86_64-windows-gnu',
+                            '-O1', '-UNDEBUG', '-I'+str(runtime), str(program), '-o', str(exe)],
+                           env=compiler_env(), check=True, capture_output=True, timeout=120)
+            subprocess.run([str(exe)], check=True, capture_output=True, timeout=15)
+
     def test_simulated_session_boundaries_and_repeated_profile_switches(self):
         from native import compiler_env
         source = (ROOT/'upstream/smm2recomp/recomp/runtime/services/mii.c').read_text(encoding='utf-8')
@@ -67,6 +135,7 @@ static Service *service_new(const char *n,void (*fn)(void),void *state) {
     static Service s; s.state=state; return &s;
 }
 // (toolchain/dlc.py declares this before the extracted function; neither title here is the DLC's)
+#include "mk8_romfs_paths.h"
 static int mk8_dlc_storage_path(uint64_t title,char *path,size_t size) { return 0; }
 ''' + body + r'''
 int main(int argc,char **argv) {
@@ -80,7 +149,7 @@ int main(int argc,char **argv) {
 }
 ''',encoding='utf-8')
             exe=out/'mount.exe'
-            subprocess.run([str(DEFAULT_COMPILER),'cc','-target','x86_64-windows-gnu','-O1','-UNDEBUG',str(source),'-o',str(exe)],check=True,env=compiler_env(),capture_output=True)
+            subprocess.run([str(DEFAULT_COMPILER),'cc','-target','x86_64-windows-gnu','-O1','-UNDEBUG','-I'+str(runtime),str(source),'-o',str(exe)],check=True,env=compiler_env(),capture_output=True)
             subprocess.run([str(exe),str(out)],cwd=out,check=True,timeout=15)
 
     def test_editor_persists_profile_and_cancel_preserves_it(self):
@@ -99,6 +168,10 @@ int main(int argc,char **argv) {
 '''+default+'''
 #include "mii/local_mii.inc"
 #include "mii/mii_editor.inc"
+#include <bcrypt.h>
+bool mk8_random(void *buffer, size_t size) {  // (runtime/mk8/services/csrng.c needs the HLE headers)
+ return BCryptGenRandom(NULL, buffer, (ULONG)size, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
+}
 static int confirm=1;
 static int opened;
 void mk8_open_mii_menu(void) { opened++; }
@@ -128,9 +201,12 @@ int main(int argc,char **argv) {
 ''', encoding='utf-8')
             exe = root/'editor.exe'
             env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(ROOT/'local/native-tools/cache'))
-            subprocess.run([str(DEFAULT_COMPILER), 'cc', '-target', 'x86_64-windows-gnu', '-O2', '-UNDEBUG', '-I'+str(ROOT/'runtime/mk8'), str(program), '-lbcrypt', '-o', str(exe)], env=env, check=True)
+            from host import DEPS  # the editor validates names with SDL_StepUTF8
+            subprocess.run([str(DEFAULT_COMPILER), 'cc', '-target', 'x86_64-windows-gnu', '-O2', '-UNDEBUG', '-I'+str(ROOT/'runtime/mk8'),
+                            '-I'+str(DEPS/'include'), str(program), str(DEPS/'lib/libSDL3.dll.a'), '-lbcrypt', '-o', str(exe)], env=env, check=True)
             profile = root/'mii-profile.json'
-            subprocess.run([str(exe), str(profile)], check=True)
+            subprocess.run([str(exe), str(profile)], check=True,
+                           env=dict(os.environ, PATH=str(DEPS/'bin') + os.pathsep + os.environ['PATH']))
             stored = json.loads(profile.read_text())
             self.assertEqual({k:stored['appearance'][k] for k in ['name','color','gender']}, {'name': 'Jo\u00e3o', 'color': 3, 'gender': 0})
             self.assertEqual(stored['appearance']['face'], {'skin':4,'shape':2,'hair':3,'hair_color':5,'eyes':2,'eye_color':1,'glasses':True,'height':90,'build':45})

@@ -78,20 +78,27 @@ pub fn download(local: &Path, last: Option<&str>) -> Result<Vec<u8>> {
 }
 
 /// Removes the user's profile path and account name from text that leaves the machine.
+/// The home folder as reports show it: `%USERPROFILE%` on Windows, `$HOME` elsewhere (a Linux report
+/// used to keep `/home/<name>`).
+#[cfg(windows)]
+const HOME: (&str, &str) = ("USERPROFILE", "%USERPROFILE%");
+#[cfg(not(windows))]
+const HOME: (&str, &str) = ("HOME", "$HOME");
+
 pub fn redact(text: &str) -> String {
     let mut out = text.to_owned();
-    if let Some(profile) = std::env::var_os("USERPROFILE").and_then(|p| p.into_string().ok()) {
+    if let Some(profile) = std::env::var_os(HOME.0).and_then(|p| p.into_string().ok()) {
         for form in [
             profile.clone(),
             profile.replace('\\', "/"),
             profile.replace('\\', "\\\\"),
         ] {
             if form.len() > 3 {
-                out = replace_ignore_case(&out, &form, "%USERPROFILE%");
+                out = replace_ignore_case(&out, &form, HOME.1);
             }
         }
     }
-    if let Ok(user) = std::env::var("USERNAME") {
+    if let Ok(user) = std::env::var(if cfg!(windows) { "USERNAME" } else { "USER" }) {
         if user.chars().count() >= 3 {
             out = replace_ignore_case(&out, &user, "<user>");
         }
@@ -194,6 +201,7 @@ fn fill(
         ("game.log".into(), local.join("game.log")),
         ("build.log".into(), local.join("build.log")),
         ("setup.log".into(), local.join("setup.log")),
+        ("dlc.log".into(), local.join("dlc.log")),
         ("candidate.json".into(), local.join("candidate.json")),
         ("config.json".into(), local.join("config.json")),
         ("vulkan-check.log".into(), local.join("vulkan-check.log")),
@@ -284,7 +292,7 @@ mod tests {
 
     #[test]
     fn redaction_hides_profile_path_and_account() {
-        let profile = std::env::var("USERPROFILE").unwrap_or_default();
+        let profile = std::env::var(HOME.0).unwrap_or_default();
         if profile.len() <= 3 {
             return;
         }
@@ -294,7 +302,7 @@ mod tests {
         );
         let clean = redact(&text);
         assert!(!clean.to_lowercase().contains(&profile.to_lowercase()));
-        assert!(clean.contains("%USERPROFILE%\\game"));
+        assert!(clean.contains(&format!("{}\\game", HOME.1)));
     }
 
     #[test]
@@ -302,6 +310,13 @@ mod tests {
         let local = std::env::temp_dir().join(format!("mk8-report-{}", std::process::id()));
         fs::create_dir_all(local.join("user-no-mii/save")).unwrap();
         fs::write(local.join("game.log"), "FATAL: test crash\n").unwrap();
+        let profile = std::env::var(HOME.0).unwrap();
+        fs::write(
+            local.join("dlc.log"),
+            format!("ValueError: invalid DLC in {profile}\\Downloads\n"),
+        )
+        .unwrap();
+        fs::write(local.join("prod.keys"), "private key fixture").unwrap();
         fs::write(local.join("vulkan-check.log"), "DLL dependency failed\n").unwrap();
         fs::write(local.join("user-no-mii/save/save_0"), "private save").unwrap();
         let runtime = local.join("builds/test/host-optimized");
@@ -336,6 +351,19 @@ mod tests {
         assert!(names.contains("mk8drecomp.previous.log"));
         assert!(!names.contains("private-save.bin"));
         assert!(!names.contains("save_0"));
+        assert!(!names.contains("prod.keys"));
+        let dlc = crate::archive_command()
+            .unwrap()
+            .arg("-xOf")
+            .arg(&zip)
+            .arg("dlc.log")
+            .output()
+            .unwrap();
+        assert!(dlc.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&dlc.stdout),
+            format!("ValueError: invalid DLC in {}\\Downloads\n", HOME.1)
+        );
         let content = crate::archive_command()
             .unwrap()
             .args(["-xOf"])

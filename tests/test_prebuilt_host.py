@@ -6,6 +6,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'toolchain'))
@@ -63,23 +64,30 @@ class PrebuiltHostTests(unittest.TestCase):
         self.assertIsNone(host.use_prebuilt(self.key, self.output))
 
     def test_key_ignores_the_build_folders_but_not_sources_or_flags(self):
-        def layout(name, text='int x;'):
+        def layout(name, text='int x;', rows='int y;'):
             job = self.root / name
             source = job / 'runtime'
             output = job / 'host-optimized'
             (source / 'runtime').mkdir(parents=True, exist_ok=True)
             (output / 'runtime').mkdir(parents=True, exist_ok=True)
             (source / 'runtime/a.c').write_text(text, encoding='utf-8')
-            (output / 'runtime/b.c').write_text('int y;', encoding='utf-8')
+            (output / 'runtime/b.c').write_text('#include "native_rows.inc"', encoding='utf-8')
+            (output / 'runtime/native_rows.inc').write_text(rows, encoding='utf-8')
             flags = ['-O2', '-I' + str(output / 'runtime'), '-I' + str(source / 'third_party'),
                      '-ffile-prefix-map=' + str(output) + '=host']
             sources = [source / 'runtime/a.c', output / 'runtime/b.c']
-            return host.host_key({'headers': {'x.h': '1'}}, flags, sources, source, output)
+            return host.host_key({'headers': host.prepared_headers(output / 'runtime')}, flags, sources, source, output)
 
-        first = layout('one')
-        self.assertEqual(first, layout('elsewhere/two'))
-        self.assertNotEqual(first, layout('three', 'int x = 1;'))
-        self.assertNotEqual(first, host.host_key({'headers': {'x.h': '2'}}, ['-O2'], [], self.root, self.root))
+        deps = self.root / 'deps'
+        (deps / 'lib').mkdir(parents=True)
+        for name in ('SDL3', 'avformat', 'avcodec', 'avutil', 'swscale', 'shaderc_shared'):
+            (deps / 'lib' / f'lib{name}.dll.a').write_text(name, encoding='ascii')
+        with patch.object(host, 'DEPS', deps), patch.object(host, 'DEFAULT_COMPILER', Path(sys.executable)):
+            first = layout('one')
+            self.assertEqual(first, layout('elsewhere/two'))
+            self.assertNotEqual(first, layout('three', 'int x = 1;'))
+            self.assertNotEqual(first, layout('one', rows='int y = 2;'))
+            self.assertNotEqual(first, host.host_key({'headers': {'x.h': '2'}}, ['-O2'], [], self.root, self.root))
 
 
 class PrebuiltFFmpegTests(unittest.TestCase):
